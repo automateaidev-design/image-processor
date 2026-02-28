@@ -1,128 +1,221 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import Response
-from rembg import remove, new_session
-from PIL import Image
+# app.py — COMPLETE DROP-IN REPLACEMENT
+# ------------------------------------------------------------
+# FastAPI endpoint that accepts multipart/form-data:
+#   - file: image upload (required)
+#   - mpn: text (optional)
+#   - sku: text (optional)
+# Returns:
+#   - a single edited PNG (transparent background)
+#   - object-aware scaled into a fixed 14:17 canvas (max size, no cropping)
+#   - Content-Disposition filename: partlogic_<mpn>_<sku>.png (sanitised)
+#
+# Requirements (you already have most):
+#   fastapi
+#   uvicorn
+#   rembg
+#   onnxruntime
+#   pillow
+#   opencv-python-headless
+#   numpy
+#   python-multipart   <-- REQUIRED for File/Form
+# ------------------------------------------------------------
+
 import io
+import re
+from typing import Optional
 
-app = FastAPI(title="image-processor")
+import numpy as np
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
+from PIL import Image, ImageOps
+from rembg import remove
 
-# Use a strong general model. u2net is a good default.
-# If you later want to test: "u2netp" (faster, sometimes worse) or "isnet-general-use" (often better edges).
-SESSION = new_session("u2net")
+
+APP_TITLE = "PartLogic Image Processor"
+APP_VERSION = "1.0.0"
+
+# Output canvas settings
+CANVAS_RATIO = (14, 17)      # width : height
+CANVAS_LONG_SIDE = 1700      # final height; width auto from ratio
 
 
-def _load_image_from_upload(upload: UploadFile) -> Image.Image:
-    data = upload.file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty upload")
+app = FastAPI(title=APP_TITLE, version=APP_VERSION)
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+
+def _safe_filename_part(s: Optional[str]) -> str:
+    """
+    Shopify-safe-ish filename component: keep letters/numbers/_- only, collapse repeats.
+    If empty/None -> 'NA'
+    """
+    if not s:
+        return "NA"
+    s = str(s).strip()
+    if not s:
+        return "NA"
+    s = s.replace(" ", "_")
+    s = re.sub(r"[^A-Za-z0-9_\-]+", "", s)
+    s = re.sub(r"[_\-]{2,}", "_", s)
+    return s or "NA"
+
+
+def object_aware_scale_aspect(
+    rgba: Image.Image,
+    canvas_ratio=(14, 17),   # width : height
+    canvas_long_side=1700,   # final height; width computed from ratio
+    resample=Image.LANCZOS
+) -> Image.Image:
+    """
+    Object-aware scaling to a fixed aspect-ratio transparent canvas.
+
+    - Keeps intrinsic object proportions (no stretching)
+    - Object becomes as large as possible without cropping
+    - Transparent background
+    """
+
+    rgba = rgba.convert("RGBA")
+
+    # 1) Tight bbox from alpha
+    alpha = rgba.split()[-1]
+    bbox = alpha.getbbox()
+
+    # If no alpha content detected, return blank canvas
+    canvas_h = int(canvas_long_side)
+    canvas_w = int(round(canvas_h * canvas_ratio[0] / canvas_ratio[1]))
+    if bbox is None:
+        return Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+
+    cropped = rgba.crop(bbox)
+    cw, ch = cropped.size
+
+    # 2) Scale so object fits fully inside canvas
+    scale = min(canvas_w / cw, canvas_h / ch)
+
+    # Optional tiny safety margin (prevents accidental edge clipping)
+    scale *= 0.995
+
+    new_w = max(1, int(round(cw * scale)))
+    new_h = max(1, int(round(ch * scale)))
+
+    resized = cropped.resize((new_w, new_h), resample)
+
+    # 3) Center on transparent canvas
+    canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    x = (canvas_w - new_w) // 2
+    y = (canvas_h - new_h) // 2
+    canvas.alpha_composite(resized, (x, y))
+    return canvas
+
+
+def read_upload_as_pil(file: UploadFile) -> Image.Image:
+    """
+    Reads UploadFile into a PIL Image. Handles EXIF orientation.
+    """
     try:
-        img = Image.open(io.BytesIO(data))
-        # Normalize to RGBA workflow, preserve alpha if any
-        if img.mode not in ("RGB", "RGBA"):
-            img = img.convert("RGBA")
+        raw = file.file.read()
+        if not raw:
+            raise ValueError("Empty file")
+        img = Image.open(io.BytesIO(raw))
+        img = ImageOps.exif_transpose(img)  # correct phone camera rotations
+        # Ensure loaded
+        img.load()
         return img
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid image file")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read image: {e}")
 
 
-def _to_png_bytes(img: Image.Image) -> bytes:
-    buf = io.BytesIO()
-    # Lossless, max quality, no resizing
-    img.save(buf, format="PNG", optimize=False)
-    return buf.getvalue()
+def rembg_remove_to_rgba(img: Image.Image) -> Image.Image:
+    """
+    Background removal using rembg.
+    Returns RGBA PIL image.
+    """
+    # rembg.remove works best on bytes / numpy; we'll do numpy -> bytes output
+    try:
+        img = img.convert("RGBA")
+        arr = np.array(img)
+        out = remove(arr)  # returns numpy array (usually) with alpha
+        out_img = Image.fromarray(out).convert("RGBA")
+        return out_img
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Background removal failed: {e}")
 
 
-def _to_jpeg_bytes(img: Image.Image, quality: int = 95) -> bytes:
-    buf = io.BytesIO()
-    # JPEG needs RGB
-    if img.mode != "RGB":
-        img = img.convert("RGB")
-    img.save(buf, format="JPEG", quality=quality, optimize=True, progressive=True)
-    return buf.getvalue()
-
+# ----------------------------
+# Routes
+# ----------------------------
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "service": APP_TITLE, "version": APP_VERSION}
 
 
 @app.post("/process")
 async def process(
     file: UploadFile = File(...),
-    # If your n8n node sends form fields, these are handy
-    return_mask: bool = Form(False),
-    return_preview_jpeg: bool = Form(False),
-
-    # Edge quality controls (defaults are tuned for product photos)
-    alpha_matting: bool = Form(True),
-    alpha_matting_foreground_threshold: int = Form(245),
-    alpha_matting_background_threshold: int = Form(10),
-    alpha_matting_erode_size: int = Form(10),
-
-    # Preview background (only used if return_preview_jpeg=True)
-    preview_bg: str = Form("white"),  # "white" or "black"
-    preview_jpeg_quality: int = Form(95),
+    mpn: Optional[str] = Form(None),
+    sku: Optional[str] = Form(None),
 ):
     """
-    Returns:
-      - Default: PNG with transparent background (lossless)
-      - Optional: mask PNG
-      - Optional: JPEG preview composited over white/black background
+    Multipart/form-data:
+      file=<image>
+      mpn=<text> (optional)
+      sku=<text> (optional)
+
+    Returns a single PNG (transparent background), object-aware scaled into 14:17 canvas.
     """
+    # Basic content-type sanity check (not strict, but helps)
+    if file.content_type and not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail=f"Unsupported content type: {file.content_type}")
 
-    # Read upload
-    img = _load_image_from_upload(file)
-    in_bytes = _to_png_bytes(img)  # normalize input as PNG bytes for rembg
+    img = read_upload_as_pil(file)
 
-    # Rembg settings
-    kwargs = {}
-    if alpha_matting:
-        kwargs.update(
-            dict(
-                alpha_matting=True,
-                alpha_matting_foreground_threshold=int(alpha_matting_foreground_threshold),
-                alpha_matting_background_threshold=int(alpha_matting_background_threshold),
-                alpha_matting_erode_size=int(alpha_matting_erode_size),
-            )
-        )
+    # 1) Remove background
+    rgba = rembg_remove_to_rgba(img)
 
-    # Perform background removal
-    try:
-        out_bytes = remove(in_bytes, session=SESSION, **kwargs)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Background removal failed: {e}")
+    # 2) Object-aware scale into fixed 14:17 canvas
+    final_img = object_aware_scale_aspect(
+        rgba,
+        canvas_ratio=CANVAS_RATIO,
+        canvas_long_side=CANVAS_LONG_SIDE
+    )
 
-    # Parse result (PNG with alpha)
-    cutout = Image.open(io.BytesIO(out_bytes)).convert("RGBA")
+    # 3) Build output filename
+    mpn_part = _safe_filename_part(mpn)
+    sku_part = _safe_filename_part(sku)
+    out_name = f"partlogic_{mpn_part}_{sku_part}.png"
 
-    # If only cutout requested, return it as image/png
-    if not return_mask and not return_preview_jpeg:
-        return Response(content=_to_png_bytes(cutout), media_type="image/png")
+    # 4) Stream PNG bytes
+    buf = io.BytesIO()
+    final_img.save(buf, format="PNG", optimize=False)  # max quality (lossless); no palette quantization
+    buf.seek(0)
 
-    # Build multipart-ish JSON response with base64 is possible,
-    # but simplest for n8n is returning files as separate endpoints.
-    # So we return a JSON with binary bytes in separate fields is not ideal in FastAPI.
-    # Instead: return a single PNG by default, OR let the client call /process?mode=...
-    #
-    # If you want both images in one response for n8n, easiest is to return a zip.
+    headers = {
+        "Content-Disposition": f'attachment; filename="{out_name}"'
+    }
+    return StreamingResponse(buf, media_type="image/png", headers=headers)
 
-    # Create a ZIP containing requested outputs (drop-in friendly for n8n)
-    import zipfile
 
-    zbuf = io.BytesIO()
-    with zipfile.ZipFile(zbuf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        z.writestr("cutout.png", _to_png_bytes(cutout))
-
-        if return_mask:
-            # mask = alpha channel
-            alpha = cutout.split()[-1]
-            mask = Image.merge("RGBA", (alpha, alpha, alpha, Image.new("L", alpha.size, 255)))
-            z.writestr("mask.png", _to_png_bytes(mask))
-
-        if return_preview_jpeg:
-            bg = (255, 255, 255) if preview_bg.lower() == "white" else (0, 0, 0)
-            background = Image.new("RGB", cutout.size, bg)
-            composed = Image.alpha_composite(background.convert("RGBA"), cutout).convert("RGB")
-            z.writestr("preview.jpg", _to_jpeg_bytes(composed, quality=int(preview_jpeg_quality)))
-
-    return Response(content=zbuf.getvalue(), media_type="application/zip")
+# Optional: helpful root message
+@app.get("/")
+def root():
+    return JSONResponse(
+        {
+            "service": APP_TITLE,
+            "version": APP_VERSION,
+            "endpoints": {
+                "health": "GET /health",
+                "process": "POST /process (multipart/form-data: file, mpn?, sku?)",
+                "docs": "GET /docs",
+            },
+            "output": {
+                "format": "PNG",
+                "background": "transparent",
+                "canvas_ratio": f"{CANVAS_RATIO[0]}:{CANVAS_RATIO[1]}",
+                "canvas_pixels": f"{int(round(CANVAS_LONG_SIDE * CANVAS_RATIO[0] / CANVAS_RATIO[1]))}x{CANVAS_LONG_SIDE}",
+                "filename": 'partlogic_<mpn>_<sku>.png (NA if missing)',
+            },
+        }
+    )
