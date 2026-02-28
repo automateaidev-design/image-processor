@@ -1,6 +1,7 @@
 fastapi
 uvicorn
 rembg
+onnxruntime
 pillow
 opencv-python-headless
 numpy
