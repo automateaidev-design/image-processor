@@ -1,6 +1,6 @@
 import io
 import os
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import numpy as np
 import cv2
@@ -14,8 +14,6 @@ from rembg import remove, new_session
 
 app = FastAPI(title="image-processor")
 
-# Use a higher-quality general model. If you already use something else, you can change this.
-# Good options: "isnet-general-use" (often better edges), "u2net"
 REMBG_MODEL = os.getenv("REMBG_MODEL", "isnet-general-use")
 session = new_session(REMBG_MODEL)
 
@@ -35,9 +33,6 @@ def _parse_bool(v: Optional[str], default: bool = False) -> bool:
 
 
 def _safe_token(s: str) -> str:
-    """
-    filename-safe (no slashes, etc). Keeps letters/numbers/_- only.
-    """
     s = (s or "").strip()
     if not s:
         return ""
@@ -47,17 +42,30 @@ def _safe_token(s: str) -> str:
 
 
 def _pil_to_rgba(im: Image.Image) -> Image.Image:
-    if im.mode != "RGBA":
-        return im.convert("RGBA")
-    return im
+    return im.convert("RGBA") if im.mode != "RGBA" else im
+
+
+def _pil_to_png_bytes(im: Image.Image) -> bytes:
+    im = _pil_to_rgba(im)
+    buf = io.BytesIO()
+    # PNG preserves alpha and is a good interchange format for rembg
+    im.save(buf, format="PNG", optimize=False)
+    return buf.getvalue()
+
+
+def _ensure_pil_rgba(x: Union[bytes, Image.Image]) -> Image.Image:
+    """
+    rembg.remove can return bytes or PIL Image depending on version / input type.
+    This normalizes to PIL RGBA.
+    """
+    if isinstance(x, Image.Image):
+        return _pil_to_rgba(x)
+    if isinstance(x, (bytes, bytearray)):
+        return Image.open(io.BytesIO(bytes(x))).convert("RGBA")
+    raise TypeError(f"Unexpected type from remove(): {type(x)}")
 
 
 def _edge_refine_alpha(rgba: Image.Image, dilate_px: int = 2, feather_px: int = 2) -> Image.Image:
-    """
-    Refines alpha edges:
-    - small dilation to prevent clipping (“eaten” object edges)
-    - small gaussian blur to anti-alias the edge
-    """
     rgba = _pil_to_rgba(rgba)
     arr = np.array(rgba)  # H,W,4
     alpha = arr[:, :, 3].astype(np.uint8)
@@ -76,9 +84,6 @@ def _edge_refine_alpha(rgba: Image.Image, dilate_px: int = 2, feather_px: int = 
 
 
 def _bbox_from_alpha(alpha: np.ndarray, thresh: int = 8) -> Optional[Tuple[int, int, int, int]]:
-    """
-    Returns bounding box (x0,y0,x1,y1) for alpha>thresh, else None.
-    """
     ys, xs = np.where(alpha > thresh)
     if len(xs) == 0 or len(ys) == 0:
         return None
@@ -93,20 +98,12 @@ def _fit_object_on_canvas(
     canvas_h: int,
     padding_ratio: float = 0.00
 ) -> Image.Image:
-    """
-    Object-aware scale:
-    - crop to object bbox
-    - scale up to fit within canvas (minus padding)
-    - center on transparent canvas
-    - never crop the object
-    """
     rgba = _pil_to_rgba(rgba)
     arr = np.array(rgba)
     alpha = arr[:, :, 3].astype(np.uint8)
 
     bbox = _bbox_from_alpha(alpha, thresh=8)
     if bbox is None:
-        # Nothing detected; just return centered original on canvas
         out = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
         x = (canvas_w - rgba.width) // 2
         y = (canvas_h - rgba.height) // 2
@@ -120,7 +117,6 @@ def _fit_object_on_canvas(
     target_w = int(canvas_w * (1.0 - 2.0 * pad))
     target_h = int(canvas_h * (1.0 - 2.0 * pad))
 
-    # scale to fit (no cropping)
     scale = min(target_w / cropped.width, target_h / cropped.height)
     new_w = max(1, int(round(cropped.width * scale)))
     new_h = max(1, int(round(cropped.height * scale)))
@@ -141,6 +137,32 @@ def _encode_lossless_webp(rgba: Image.Image) -> bytes:
     return buf.getvalue()
 
 
+def _remove_background(
+    pil_rgba: Image.Image,
+    *,
+    use_matting: bool,
+    fg_thresh: int,
+    bg_thresh: int,
+    erode_size: int
+) -> Image.Image:
+    """
+    Forces bytes-in to rembg, then converts whatever comes back into PIL RGBA.
+    """
+    png_bytes = _pil_to_png_bytes(pil_rgba)
+
+    out = remove(
+        png_bytes,                 # <-- BYTES IN (important)
+        session=session,
+        alpha_matting=use_matting,
+        alpha_matting_foreground_threshold=int(fg_thresh),
+        alpha_matting_background_threshold=int(bg_thresh),
+        alpha_matting_erode_size=int(erode_size),
+        post_process_mask=True,
+    )
+
+    return _ensure_pil_rgba(out)
+
+
 # ----------------------------
 # Routes
 # ----------------------------
@@ -154,27 +176,22 @@ def health():
 async def process(
     file: UploadFile = File(...),
 
-    # naming inputs (from your sheet)
     mpn: Optional[str] = Form(None),
     sku: Optional[str] = Form(None),
 
-    # output controls
-    output: str = Form("webp"),  # "webp" only (kept for compatibility)
+    output: str = Form("webp"),
     canvas_w: int = Form(1400),
-    canvas_h: int = Form(1700),  # 14:17 default
+    canvas_h: int = Form(1700),
     padding_ratio: float = Form(0.00),
 
-    # rembg controls
     alpha_matting: Optional[str] = Form("true"),
     alpha_matting_foreground_threshold: int = Form(245),
     alpha_matting_background_threshold: int = Form(10),
     alpha_matting_erode_size: int = Form(10),
 
-    # edge refinement (these fix your jaggies + object clipping)
     edge_dilate_px: int = Form(2),
     edge_feather_px: int = Form(2),
 
-    # improves quality on small images: upscale before segmentation (1 = off, 2 recommended)
     pre_upscale: int = Form(2),
 ):
     try:
@@ -182,10 +199,10 @@ async def process(
         if not raw:
             return JSONResponse({"error": "Empty upload"}, status_code=400)
 
-        # load image
+        # Load input
         img = Image.open(io.BytesIO(raw)).convert("RGBA")
 
-        # optional pre-upscale for better masks on small images
+        # Pre-upscale (helps segmentation on small images)
         pre_upscale = int(_clamp(float(pre_upscale), 1, 4))
         if pre_upscale > 1:
             img = img.resize(
@@ -193,29 +210,23 @@ async def process(
                 resample=Image.Resampling.LANCZOS
             )
 
-        # Background removal via rembg
-        use_matting = _parse_bool(alpha_matting, default=True)
-
-        removed_bytes = remove(
+        # Background removal
+        cutout = _remove_background(
             img,
-            session=session,
-            alpha_matting=use_matting,
-            alpha_matting_foreground_threshold=int(alpha_matting_foreground_threshold),
-            alpha_matting_background_threshold=int(alpha_matting_background_threshold),
-            alpha_matting_erode_size=int(alpha_matting_erode_size),
-            post_process_mask=True,  # important
+            use_matting=_parse_bool(alpha_matting, default=True),
+            fg_thresh=int(alpha_matting_foreground_threshold),
+            bg_thresh=int(alpha_matting_background_threshold),
+            erode_size=int(alpha_matting_erode_size),
         )
 
-        cutout = Image.open(io.BytesIO(removed_bytes)).convert("RGBA")
-
-        # refine edges (prevents “eaten” edges + reduces jaggies)
+        # Edge refinement to prevent clipping + reduce jaggies
         cutout = _edge_refine_alpha(
             cutout,
             dilate_px=int(_clamp(float(edge_dilate_px), 0, 12)),
             feather_px=int(_clamp(float(edge_feather_px), 0, 12)),
         )
 
-        # Fit onto 14:17 canvas as large as possible, no cropping
+        # Fit to 14:17 canvas, as large as possible, no cropping
         canvas_w = int(_clamp(float(canvas_w), 64, 6000))
         canvas_h = int(_clamp(float(canvas_h), 64, 6000))
         padding_ratio = float(_clamp(float(padding_ratio), 0.0, 0.40))
@@ -227,7 +238,7 @@ async def process(
             padding_ratio=padding_ratio
         )
 
-        # Build filename: partlogic_MPN_SKU.webp
+        # Output filename
         mpn_s = _safe_token(mpn or "no-mpn")
         sku_s = _safe_token(sku or "no-sku")
         out_name = f"partlogic_{mpn_s}_{sku_s}.webp"
