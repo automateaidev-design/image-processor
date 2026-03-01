@@ -1,245 +1,247 @@
 import io
 import os
-import zipfile
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import numpy as np
-from fastapi import FastAPI, File, Form, UploadFile
-from fastapi.responses import StreamingResponse, JSONResponse
+import cv2
+from PIL import Image
 
-from PIL import Image, ImageFilter, ImageChops
-from rembg import remove
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import Response, JSONResponse
+
+from rembg import remove, new_session
 
 
-app = FastAPI(title="PartLogic Image Processor", version="1.2.0")
+app = FastAPI(title="image-processor")
+
+# Use a higher-quality general model. If you already use something else, you can change this.
+# Good options: "isnet-general-use" (often better edges), "u2net"
+REMBG_MODEL = os.getenv("REMBG_MODEL", "isnet-general-use")
+session = new_session(REMBG_MODEL)
 
 
-# -----------------------------
+# ----------------------------
 # Helpers
-# -----------------------------
+# ----------------------------
 
-def _safe(s: Optional[str]) -> str:
-    return (s or "").strip()
-
-
-def build_filename(mpn: str, sku: str, prefix: str = "partlogic", ext: str = "webp") -> str:
-    mpn = _safe(mpn)
-    sku = _safe(sku)
-    base = f'{prefix}_{mpn}_{sku}' if (mpn or sku) else prefix
-    # very light sanitization
-    base = "".join(c for c in base if c.isalnum() or c in ("_", "-", "."))
-    return f"{base}.{ext}"
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
 
 
-def parse_canvas(canvas: str, default=(1400, 1700)) -> Tuple[int, int]:
-    """
-    canvas: "1400x1700"
-    """
-    try:
-        w, h = canvas.lower().split("x")
-        w, h = int(w), int(h)
-        if w <= 0 or h <= 0:
-            return default
-        return w, h
-    except Exception:
+def _parse_bool(v: Optional[str], default: bool = False) -> bool:
+    if v is None:
         return default
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
-def to_rgba(img: Image.Image) -> Image.Image:
-    if img.mode != "RGBA":
-        return img.convert("RGBA")
-    return img
-
-
-def alpha_bbox(img_rgba: Image.Image, alpha_threshold: int = 8):
+def _safe_token(s: str) -> str:
     """
-    Return bounding box of alpha channel above threshold.
+    filename-safe (no slashes, etc). Keeps letters/numbers/_- only.
     """
-    a = img_rgba.split()[-1]
-    # convert to binary-ish mask for bbox
-    mask = a.point(lambda p: 255 if p > alpha_threshold else 0)
-    return mask.getbbox()
+    s = (s or "").strip()
+    if not s:
+        return ""
+    s = s.replace(" ", "-")
+    s = "".join(ch for ch in s if ch.isalnum() or ch in ("-", "_"))
+    return s[:160]
 
 
-def object_aware_fit(img_rgba: Image.Image, canvas_w: int, canvas_h: int, max_fill: float = 1.0) -> Image.Image:
-    """
-    Scales the detected object (via alpha bbox) to be as large as possible within the canvas
-    without cropping, preserving aspect ratio. Object may touch sides or top/bottom.
-    max_fill allows optional margin (<1.0). We keep 1.0 (tight) per your request.
-    """
-    img_rgba = to_rgba(img_rgba)
+def _pil_to_rgba(im: Image.Image) -> Image.Image:
+    if im.mode != "RGBA":
+        return im.convert("RGBA")
+    return im
 
-    bbox = alpha_bbox(img_rgba, alpha_threshold=8)
-    if not bbox:
-        # no alpha info; just fit whole image
-        bbox = (0, 0, img_rgba.width, img_rgba.height)
+
+def _edge_refine_alpha(rgba: Image.Image, dilate_px: int = 2, feather_px: int = 2) -> Image.Image:
+    """
+    Refines alpha edges:
+    - small dilation to prevent clipping (“eaten” object edges)
+    - small gaussian blur to anti-alias the edge
+    """
+    rgba = _pil_to_rgba(rgba)
+    arr = np.array(rgba)  # H,W,4
+    alpha = arr[:, :, 3].astype(np.uint8)
+
+    if dilate_px > 0:
+        k = 2 * dilate_px + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        alpha = cv2.dilate(alpha, kernel, iterations=1)
+
+    if feather_px > 0:
+        k = 2 * feather_px + 1
+        alpha = cv2.GaussianBlur(alpha, (k, k), sigmaX=0)
+
+    arr[:, :, 3] = alpha
+    return Image.fromarray(arr, mode="RGBA")
+
+
+def _bbox_from_alpha(alpha: np.ndarray, thresh: int = 8) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Returns bounding box (x0,y0,x1,y1) for alpha>thresh, else None.
+    """
+    ys, xs = np.where(alpha > thresh)
+    if len(xs) == 0 or len(ys) == 0:
+        return None
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    return x0, y0, x1, y1
+
+
+def _fit_object_on_canvas(
+    rgba: Image.Image,
+    canvas_w: int,
+    canvas_h: int,
+    padding_ratio: float = 0.00
+) -> Image.Image:
+    """
+    Object-aware scale:
+    - crop to object bbox
+    - scale up to fit within canvas (minus padding)
+    - center on transparent canvas
+    - never crop the object
+    """
+    rgba = _pil_to_rgba(rgba)
+    arr = np.array(rgba)
+    alpha = arr[:, :, 3].astype(np.uint8)
+
+    bbox = _bbox_from_alpha(alpha, thresh=8)
+    if bbox is None:
+        # Nothing detected; just return centered original on canvas
+        out = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+        x = (canvas_w - rgba.width) // 2
+        y = (canvas_h - rgba.height) // 2
+        out.paste(rgba, (x, y), rgba)
+        return out
 
     x0, y0, x1, y1 = bbox
-    obj = img_rgba.crop((x0, y0, x1, y1))
+    cropped = rgba.crop((x0, y0, x1, y1))
 
-    # Fit object into canvas
-    obj_w, obj_h = obj.size
-    if obj_w <= 0 or obj_h <= 0:
-        return Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    pad = _clamp(padding_ratio, 0.0, 0.40)
+    target_w = int(canvas_w * (1.0 - 2.0 * pad))
+    target_h = int(canvas_h * (1.0 - 2.0 * pad))
 
-    scale = min((canvas_w / obj_w), (canvas_h / obj_h)) * max_fill
-    new_w = max(1, int(round(obj_w * scale)))
-    new_h = max(1, int(round(obj_h * scale)))
+    # scale to fit (no cropping)
+    scale = min(target_w / cropped.width, target_h / cropped.height)
+    new_w = max(1, int(round(cropped.width * scale)))
+    new_h = max(1, int(round(cropped.height * scale)))
 
-    obj_resized = obj.resize((new_w, new_h), resample=Image.LANCZOS)
+    resized = cropped.resize((new_w, new_h), resample=Image.Resampling.LANCZOS)
 
-    # Center on canvas
     out = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
-    px = (canvas_w - new_w) // 2
-    py = (canvas_h - new_h) // 2
-    out.paste(obj_resized, (px, py), obj_resized)
-
+    x = (canvas_w - new_w) // 2
+    y = (canvas_h - new_h) // 2
+    out.paste(resized, (x, y), resized)
     return out
 
 
-def defringe_edges(img_rgba: Image.Image, strength: int = 1) -> Image.Image:
-    """
-    Reduces edge halos by slightly shrinking alpha and smoothing edge.
-    strength=1 is conservative.
-    """
-    img_rgba = to_rgba(img_rgba)
-    r, g, b, a = img_rgba.split()
-
-    # Slightly erode alpha by using MinFilter, then soften a touch
-    # (strength controls how aggressively we shrink edges)
-    if strength > 0:
-        a2 = a.filter(ImageFilter.MinFilter(size=3))
-        # very small blur to avoid jaggies from erosion
-        a2 = a2.filter(ImageFilter.GaussianBlur(radius=0.35))
-    else:
-        a2 = a
-
-    out = Image.merge("RGBA", (r, g, b, a2))
-    return out
-
-
-def rembg_cutout(pil_img: Image.Image) -> Image.Image:
-    """
-    Background removal with better edges using alpha matting.
-    """
-    pil_img = pil_img.convert("RGBA")
-
-    # rembg params tuned to reduce halos but not delete object
-    # You can tweak these later if needed.
-    out = remove(
-        pil_img,
-        alpha_matting=True,
-        alpha_matting_foreground_threshold=240,
-        alpha_matting_background_threshold=15,
-        alpha_matting_erode_size=12
-    )
-
-    if not isinstance(out, Image.Image):
-        # rembg can return bytes in some configurations, handle safely
-        out = Image.open(io.BytesIO(out)).convert("RGBA")
-
-    # extra conservative defringe
-    out = defringe_edges(out, strength=1)
-    return out
-
-
-def encode_lossless_webp(img: Image.Image) -> io.BytesIO:
+def _encode_lossless_webp(rgba: Image.Image) -> bytes:
+    rgba = _pil_to_rgba(rgba)
     buf = io.BytesIO()
-    img.save(
-        buf,
-        format="WEBP",
-        lossless=True,
-        quality=100,
-        method=6
-    )
-    buf.seek(0)
-    return buf
+    rgba.save(buf, format="WEBP", lossless=True, method=6, exact=True)
+    return buf.getvalue()
 
 
-def composite_background(img_rgba: Image.Image, bg: str) -> Image.Image:
-    """
-    bg: "transparent" (default) or "white"
-    """
-    bg = (_safe(bg) or "transparent").lower()
-    img_rgba = to_rgba(img_rgba)
-
-    if bg == "white":
-        base = Image.new("RGB", (img_rgba.width, img_rgba.height), (255, 255, 255))
-        base.paste(img_rgba, (0, 0), img_rgba)
-        return base
-    return img_rgba
-
-
-# -----------------------------
+# ----------------------------
 # Routes
-# -----------------------------
+# ----------------------------
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "model": REMBG_MODEL}
 
 
 @app.post("/process")
 async def process(
-    # Backwards-compatible: accept either "file" or "files"
-    file: Optional[UploadFile] = File(None),
-    files: Optional[List[UploadFile]] = File(None),
+    file: UploadFile = File(...),
 
-    mpn: str = Form(""),
-    sku: str = Form(""),
-    prefix: str = Form("partlogic"),
+    # naming inputs (from your sheet)
+    mpn: Optional[str] = Form(None),
+    sku: Optional[str] = Form(None),
 
-    # Output controls
-    background: str = Form("transparent"),     # "transparent" or "white"
-    canvas: str = Form("1400x1700"),           # must be 14:17 for your workflow
+    # output controls
+    output: str = Form("webp"),  # "webp" only (kept for compatibility)
+    canvas_w: int = Form(1400),
+    canvas_h: int = Form(1700),  # 14:17 default
+    padding_ratio: float = Form(0.00),
+
+    # rembg controls
+    alpha_matting: Optional[str] = Form("true"),
+    alpha_matting_foreground_threshold: int = Form(245),
+    alpha_matting_background_threshold: int = Form(10),
+    alpha_matting_erode_size: int = Form(10),
+
+    # edge refinement (these fix your jaggies + object clipping)
+    edge_dilate_px: int = Form(2),
+    edge_feather_px: int = Form(2),
+
+    # improves quality on small images: upscale before segmentation (1 = off, 2 recommended)
+    pre_upscale: int = Form(2),
 ):
-    # Collect uploads
-    uploads: List[UploadFile] = []
-    if files:
-        uploads.extend(files)
-    if file:
-        uploads.append(file)
+    try:
+        raw = await file.read()
+        if not raw:
+            return JSONResponse({"error": "Empty upload"}, status_code=400)
 
-    if not uploads:
-        return JSONResponse({"error": "No file(s) uploaded. Use form-data field 'file' or 'files'."}, status_code=400)
+        # load image
+        img = Image.open(io.BytesIO(raw)).convert("RGBA")
 
-    canvas_w, canvas_h = parse_canvas(canvas, default=(1400, 1700))
+        # optional pre-upscale for better masks on small images
+        pre_upscale = int(_clamp(float(pre_upscale), 1, 4))
+        if pre_upscale > 1:
+            img = img.resize(
+                (img.width * pre_upscale, img.height * pre_upscale),
+                resample=Image.Resampling.LANCZOS
+            )
 
-    # If multiple uploads, return a ZIP to preserve all outputs
-    if len(uploads) > 1:
-        zbuf = io.BytesIO()
-        with zipfile.ZipFile(zbuf, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
-            for idx, up in enumerate(uploads, start=1):
-                raw = await up.read()
-                pil = Image.open(io.BytesIO(raw)).convert("RGBA")
+        # Background removal via rembg
+        use_matting = _parse_bool(alpha_matting, default=True)
 
-                cut = rembg_cutout(pil)
-                fitted = object_aware_fit(cut, canvas_w, canvas_h, max_fill=1.0)
-                final_img = composite_background(fitted, background)
+        removed_bytes = remove(
+            img,
+            session=session,
+            alpha_matting=use_matting,
+            alpha_matting_foreground_threshold=int(alpha_matting_foreground_threshold),
+            alpha_matting_background_threshold=int(alpha_matting_background_threshold),
+            alpha_matting_erode_size=int(alpha_matting_erode_size),
+            post_process_mask=True,  # important
+        )
 
-                out_name = build_filename(mpn, sku, prefix=prefix, ext="webp")
-                # avoid collisions inside zip
-                if idx > 1:
-                    out_name = out_name.replace(".webp", f"_{idx}.webp")
+        cutout = Image.open(io.BytesIO(removed_bytes)).convert("RGBA")
 
-                wb = encode_lossless_webp(final_img)
-                z.writestr(out_name, wb.getvalue())
+        # refine edges (prevents “eaten” edges + reduces jaggies)
+        cutout = _edge_refine_alpha(
+            cutout,
+            dilate_px=int(_clamp(float(edge_dilate_px), 0, 12)),
+            feather_px=int(_clamp(float(edge_feather_px), 0, 12)),
+        )
 
-        zbuf.seek(0)
-        headers = {"Content-Disposition": 'attachment; filename="partlogic_processed_images.zip"'}
-        return StreamingResponse(zbuf, media_type="application/zip", headers=headers)
+        # Fit onto 14:17 canvas as large as possible, no cropping
+        canvas_w = int(_clamp(float(canvas_w), 64, 6000))
+        canvas_h = int(_clamp(float(canvas_h), 64, 6000))
+        padding_ratio = float(_clamp(float(padding_ratio), 0.0, 0.40))
 
-    # Single upload -> single WebP
-    up = uploads[0]
-    raw = await up.read()
-    pil = Image.open(io.BytesIO(raw)).convert("RGBA")
+        final_img = _fit_object_on_canvas(
+            cutout,
+            canvas_w=canvas_w,
+            canvas_h=canvas_h,
+            padding_ratio=padding_ratio
+        )
 
-    cut = rembg_cutout(pil)
-    fitted = object_aware_fit(cut, canvas_w, canvas_h, max_fill=1.0)
-    final_img = composite_background(fitted, background)
+        # Build filename: partlogic_MPN_SKU.webp
+        mpn_s = _safe_token(mpn or "no-mpn")
+        sku_s = _safe_token(sku or "no-sku")
+        out_name = f"partlogic_{mpn_s}_{sku_s}.webp"
 
-    out_name = build_filename(mpn, sku, prefix=prefix, ext="webp")
-    buf = encode_lossless_webp(final_img)
+        out_bytes = _encode_lossless_webp(final_img)
 
-    headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
-    return StreamingResponse(buf, media_type="image/webp", headers=headers)
+        return Response(
+            content=out_bytes,
+            media_type="image/webp",
+            headers={
+                "Content-Disposition": f'inline; filename="{out_name}"',
+                "X-Output-Filename": out_name,
+            },
+        )
+
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
