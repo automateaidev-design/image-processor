@@ -16,34 +16,30 @@ from rembg import remove, new_session
 # Stability / performance knobs
 # ----------------------------
 
-# Prevent OpenCV from spawning huge thread pools (common cause of instability on small containers)
 try:
     cv2.setNumThreads(1)
 except Exception:
     pass
 
-# Prevent Pillow decompression bombs / insane uploads from killing RAM
-# (set via env if you want; default is conservative for e-comm photos)
-PIL_MAX_IMAGE_PIXELS = int(os.getenv("PIL_MAX_IMAGE_PIXELS", "60000000"))  # 60 MP
+PIL_MAX_IMAGE_PIXELS = int(os.getenv("PIL_MAX_IMAGE_PIXELS", "60000000"))
 Image.MAX_IMAGE_PIXELS = PIL_MAX_IMAGE_PIXELS
 
-# Concurrency cap (backpressure) - set to 1..3 for heavy rembg + matting
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "2"))
-QUEUE_TIMEOUT_S = float(os.getenv("QUEUE_TIMEOUT_S", "15"))  # if busy, fail fast
+QUEUE_TIMEOUT_S = float(os.getenv("QUEUE_TIMEOUT_S", "15"))
 
-# Force periodic self-restart (optional; better to use gunicorn --max-requests)
-# Set ENABLE_SELF_RESTART=1 and SELF_RESTART_SECONDS=600 if you really want it.
 ENABLE_SELF_RESTART = os.getenv("ENABLE_SELF_RESTART", "0") == "1"
 SELF_RESTART_SECONDS = int(os.getenv("SELF_RESTART_SECONDS", "600"))
+
+PROCESS_TIMEOUT_S = int(os.getenv("PROCESS_TIMEOUT_S", "240"))
 
 # ----------------------------
 # App + model session
 # ----------------------------
 
-app = FastAPI(title="image-processor", version="2.2.0")
+app = FastAPI(title="image-processor", version="2.3.0")
 
 REMBG_MODEL = os.getenv("REMBG_MODEL", "u2net")
-_session = None  # initialized per worker on startup
+_session = None
 
 TARGET_W = int(os.getenv("TARGET_W", "1400"))
 TARGET_H = int(os.getenv("TARGET_H", "1700"))
@@ -51,33 +47,28 @@ TARGET_H = int(os.getenv("TARGET_H", "1700"))
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
-# Global semaphore for backpressure (per worker)
 SEM = asyncio.Semaphore(max(1, MAX_CONCURRENCY))
 
 
 @app.on_event("startup")
 async def _startup():
-    """
-    Create the rembg session *inside* the worker process.
-    This is more stable with gunicorn preloading/forking and keeps memory predictable.
-    """
     global _session
-
-    # Load model/session once per worker
     _session = new_session(REMBG_MODEL)
 
-    # Optional self-restart loop (only if you turn it on)
     if ENABLE_SELF_RESTART:
         async def _restarter():
             await asyncio.sleep(max(60, SELF_RESTART_SECONDS))
-            # Exiting the process lets Railway/gunicorn restart cleanly (clears RAM)
-            os._exit(0)  # noqa: S606
+            os._exit(0)
 
         asyncio.create_task(_restarter())
 
 
 def clamp_int(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, int(v)))
+
+
+def clamp_float(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, float(v)))
 
 
 def pil_open_rgb(data: bytes) -> Image.Image:
@@ -95,7 +86,7 @@ def pre_upscale_if_small(img: Image.Image, min_max_dim: int = 900) -> Image.Imag
     scale = min_max_dim / float(m)
     new_w = int(round(w * scale))
     new_h = int(round(h * scale))
-    return img.resize((new_w, new_h), Image.BICUBIC)
+    return img.resize((new_w, new_h), Image.LANCZOS)
 
 
 def ensure_rgba(png_bytes: bytes) -> Image.Image:
@@ -146,8 +137,7 @@ def object_aware_fit(
     padding_ratio: float = 0.0,
     alpha_thresh: int = 8,
 ) -> np.ndarray:
-    pad = float(padding_ratio)
-    pad = max(0.0, min(0.49, pad))
+    pad = clamp_float(padding_ratio, 0.0, 0.49)
 
     alpha = rgba[:, :, 3]
     bbox = alpha_bbox(alpha, thresh=alpha_thresh)
@@ -214,10 +204,6 @@ def save_png(rgba_arr: np.ndarray) -> bytes:
 
 
 def decontaminate_edge_rgb(rgba: np.ndarray, alpha_max: int = 200, inpaint_radius: int = 3) -> np.ndarray:
-    """
-    Removes “halo” by fixing RGB values in semi-transparent edge pixels.
-    We inpaint ONLY where alpha is between 1..alpha_max (edge band).
-    """
     alpha = rgba[:, :, 3]
     mask = ((alpha > 0) & (alpha < alpha_max)).astype(np.uint8) * 255
     if mask.max() == 0:
@@ -230,15 +216,205 @@ def decontaminate_edge_rgb(rgba: np.ndarray, alpha_max: int = 200, inpaint_radiu
     return out
 
 
+def rgba_from_rgb_alpha(rgb: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    out = np.dstack([rgb, alpha]).astype(np.uint8)
+    return out
+
+
+def largest_component(alpha: np.ndarray, min_area_ratio: float = 0.001) -> np.ndarray:
+    mask = (alpha > 0).astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels <= 1:
+        return alpha
+
+    h, w = alpha.shape[:2]
+    min_area = max(1, int(h * w * min_area_ratio))
+
+    areas = stats[:, cv2.CC_STAT_AREA]
+    best_label = 0
+    best_area = 0
+    for i in range(1, num_labels):
+        area = int(areas[i])
+        if area >= min_area and area > best_area:
+            best_area = area
+            best_label = i
+
+    if best_label == 0:
+        return alpha
+
+    keep = (labels == best_label).astype(np.uint8) * 255
+    out = alpha.copy()
+    out[keep == 0] = 0
+    return out
+
+
+def estimate_corner_bg_bgr(img_bgr: np.ndarray, patch_frac: float = 0.08) -> Tuple[np.ndarray, float]:
+    h, w = img_bgr.shape[:2]
+    ph = max(8, int(h * patch_frac))
+    pw = max(8, int(w * patch_frac))
+
+    patches = [
+        img_bgr[0:ph, 0:pw],
+        img_bgr[0:ph, w - pw:w],
+        img_bgr[h - ph:h, 0:pw],
+        img_bgr[h - ph:h, w - pw:w],
+    ]
+    pixels = np.concatenate([p.reshape(-1, 3) for p in patches], axis=0).astype(np.float32)
+    mean = pixels.mean(axis=0)
+    std = float(np.mean(pixels.std(axis=0)))
+    return mean, std
+
+
+def uniform_background_mask(
+    rgb: np.ndarray,
+    bg_tolerance: int = 26,
+    patch_frac: float = 0.08,
+    corner_uniformity_max_std: float = 22.0,
+    edge_margin_frac: float = 0.02,
+) -> Tuple[Optional[np.ndarray], dict]:
+    """
+    Returns alpha mask for images with a mostly-uniform background based on corner sampling.
+    Foreground = pixels sufficiently different from estimated corner background.
+    """
+    img_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    h, w = img_bgr.shape[:2]
+
+    bg_mean_bgr, bg_std = estimate_corner_bg_bgr(img_bgr, patch_frac=patch_frac)
+    info = {
+        "bg_std": float(bg_std),
+        "mode": "uniform-bg",
+        "bg_mean_bgr": [float(x) for x in bg_mean_bgr],
+    }
+
+    if bg_std > corner_uniformity_max_std:
+        return None, info
+
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    bg_lab = cv2.cvtColor(np.uint8([[bg_mean_bgr]]), cv2.COLOR_BGR2LAB).astype(np.float32)[0, 0]
+
+    dist = np.sqrt(np.sum((lab - bg_lab) ** 2, axis=2))
+    fg_mask = (dist >= float(bg_tolerance)).astype(np.uint8) * 255
+
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
+    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
+
+    fg_mask = largest_component(fg_mask, min_area_ratio=0.002)
+
+    bbox = alpha_bbox(fg_mask, thresh=8)
+    if bbox is None:
+        return None, info
+
+    x1, y1, x2, y2 = bbox
+    box_area = max(1, (x2 - x1) * (y2 - y1))
+    fill_ratio = float(np.count_nonzero(fg_mask)) / float(h * w)
+
+    touches_left = x1 <= int(w * edge_margin_frac)
+    touches_right = x2 >= w - int(w * edge_margin_frac)
+    touches_top = y1 <= int(h * edge_margin_frac)
+    touches_bottom = y2 >= h - int(h * edge_margin_frac)
+    touches_edges = sum([touches_left, touches_right, touches_top, touches_bottom])
+
+    info.update({
+        "fill_ratio": fill_ratio,
+        "bbox": [int(x1), int(y1), int(x2), int(y2)],
+        "touches_edges": touches_edges,
+        "bbox_area_ratio": box_area / float(h * w),
+    })
+
+    if fill_ratio < 0.01:
+        return None, info
+
+    return fg_mask, info
+
+
+def rembg_cutout(
+    rgb_img: Image.Image,
+    alpha_matting: bool,
+    alpha_matting_foreground_threshold: int,
+    alpha_matting_background_threshold: int,
+    alpha_matting_erode_size: int,
+) -> np.ndarray:
+    tmp = io.BytesIO()
+    rgb_img.save(tmp, format="PNG")
+    png_in = tmp.getvalue()
+
+    cutout_png = remove(
+        png_in,
+        session=_session,
+        alpha_matting=bool(alpha_matting),
+        alpha_matting_foreground_threshold=clamp_int(alpha_matting_foreground_threshold, 0, 255),
+        alpha_matting_background_threshold=clamp_int(alpha_matting_background_threshold, 0, 255),
+        alpha_matting_erode_size=clamp_int(alpha_matting_erode_size, 0, 50),
+    )
+    rgba_pil = ensure_rgba(cutout_png)
+    return np.array(rgba_pil)
+
+
+def apply_edge_postprocess(
+    rgba: np.ndarray,
+    edge_erode_px: int,
+    edge_dilate_px: int,
+    edge_feather_px: int,
+    decontaminate: bool,
+    decontaminate_alpha_max: int,
+    decontaminate_inpaint_radius: int,
+) -> np.ndarray:
+    a = rgba[:, :, 3]
+    a = erode(a, clamp_int(edge_erode_px, 0, 30))
+    a = dilate(a, clamp_int(edge_dilate_px, 0, 30))
+    a = feather(a, clamp_int(edge_feather_px, 0, 30))
+    rgba[:, :, 3] = a
+
+    if decontaminate:
+        rgba = decontaminate_edge_rgb(
+            rgba,
+            alpha_max=clamp_int(decontaminate_alpha_max, 1, 254),
+            inpaint_radius=clamp_int(decontaminate_inpaint_radius, 1, 12),
+        )
+    return rgba
+
+
+def pick_best_cutout(
+    rgb: np.ndarray,
+    uniform_rgba: Optional[np.ndarray],
+    rembg_rgba: Optional[np.ndarray],
+    prefer_uniform_bg: bool = True,
+) -> Tuple[np.ndarray, str]:
+    """
+    Hybrid chooser:
+    - If a strong uniform-background mask exists, prefer it for catalogue/product images.
+    - Otherwise use rembg.
+    """
+    if uniform_rgba is not None and prefer_uniform_bg:
+        ua = uniform_rgba[:, :, 3]
+        ub = alpha_bbox(ua, thresh=8)
+        if ub is not None:
+            return uniform_rgba, "uniform-bg"
+
+    if rembg_rgba is not None:
+        return rembg_rgba, "rembg"
+
+    if uniform_rgba is not None:
+        return uniform_rgba, "uniform-bg"
+
+    h, w = rgb.shape[:2]
+    return np.zeros((h, w, 4), dtype=np.uint8), "empty"
+
+
 @app.get("/health")
 def health():
-    return {"ok": True, "model": REMBG_MODEL, "max_concurrency": MAX_CONCURRENCY}
+    return {
+        "ok": True,
+        "model": REMBG_MODEL,
+        "max_concurrency": MAX_CONCURRENCY,
+        "process_timeout_s": PROCESS_TIMEOUT_S,
+    }
 
 
 @app.get("/ready")
 def ready():
-    # Simple readiness: if we can immediately acquire 1 slot, we're "ready".
-    # This prevents callers from piling onto an overloaded instance.
     if SEM.locked():
         return JSONResponse({"ready": False, "reason": "busy"}, status_code=503)
     return {"ready": True}
@@ -254,22 +430,30 @@ async def process_image(
 
     output: str = Form("webp"),  # webp | png
 
-    # Rembg controls (tune in n8n without redeploy)
-    alpha_matting: bool = Form(True),
-    # Better defaults for white/industrial products:
+    # Strategy
+    segmentation_mode: str = Form("auto"),  # auto | rembg | uniform_bg
+    prefer_uniform_bg: bool = Form(True),
+
+    # Uniform background controls
+    uniform_bg_tolerance: int = Form(26),
+    uniform_bg_corner_patch_frac: float = Form(0.08),
+    uniform_bg_max_corner_std: float = Form(22.0),
+
+    # Rembg controls
+    alpha_matting: bool = Form(False),
     alpha_matting_foreground_threshold: int = Form(250),
     alpha_matting_background_threshold: int = Form(15),
     alpha_matting_erode_size: int = Form(2),
 
-    # Edge controls (better defaults for crisp ecommerce cutouts)
-    edge_erode_px: int = Form(1),      # 1 is usually enough; 2 can shrink too much
-    edge_dilate_px: int = Form(0),     # keep 0 unless you need thicker edges
-    edge_feather_px: int = Form(0),    # KEEP 0 to avoid grey fringe
+    # Edge controls
+    edge_erode_px: int = Form(1),
+    edge_dilate_px: int = Form(0),
+    edge_feather_px: int = Form(0),
 
     # Decontaminate edge RGB
     decontaminate: bool = Form(True),
     decontaminate_alpha_max: int = Form(200),
-    decontaminate_inpaint_radius: int = Form(8),  # 200 is way too high; keep 6-12
+    decontaminate_inpaint_radius: int = Form(8),
 
     # Canvas controls
     padding_ratio: float = Form(0.0),
@@ -279,8 +463,10 @@ async def process_image(
     # Quality/perf
     pre_upscale: bool = Form(True),
     pre_upscale_min_dim: int = Form(900),
+
+    # Response extras
+    debug_headers: bool = Form(False),
 ):
-    # Backpressure: if overloaded, fail fast rather than timing out and wedging n8n
     try:
         await asyncio.wait_for(SEM.acquire(), timeout=QUEUE_TIMEOUT_S)
     except asyncio.TimeoutError:
@@ -289,15 +475,17 @@ async def process_image(
             status_code=503,
         )
 
-    rgba = None
-    fitted = None
+    raw = None
     pil_img = None
-    rgba_pil = None
-    tmp = None
+    rgb = None
+    uniform_alpha = None
+    uniform_rgba = None
+    rembg_rgba = None
+    chosen_rgba = None
+    fitted = None
 
     try:
         if _session is None:
-            # Should not happen if startup ran; still guard
             return JSONResponse({"error": "Model session not ready"}, status_code=503)
 
         raw = await file.read()
@@ -308,51 +496,68 @@ async def process_image(
 
         pil_img = pil_open_rgb(raw)
 
-        # Hard cap dimensions to protect RAM if someone uploads a massive image
         w, h = pil_img.size
         max_dim = int(os.getenv("MAX_IMAGE_DIM", "8000"))
         if max(w, h) > max_dim:
             scale = max_dim / float(max(w, h))
-            pil_img = pil_img.resize((int(w * scale), int(h * scale)), Image.BICUBIC)
+            pil_img = pil_img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
         if pre_upscale:
             pil_img = pre_upscale_if_small(pil_img, min_max_dim=clamp_int(pre_upscale_min_dim, 256, 2400))
 
-        tmp = io.BytesIO()
-        pil_img.save(tmp, format="PNG")
-        png_in = tmp.getvalue()
+        rgb = np.array(pil_img.convert("RGB"))
 
-        cutout_png = remove(
-            png_in,
-            session=_session,
-            alpha_matting=bool(alpha_matting),
-            alpha_matting_foreground_threshold=clamp_int(alpha_matting_foreground_threshold, 0, 255),
-            alpha_matting_background_threshold=clamp_int(alpha_matting_background_threshold, 0, 255),
-            alpha_matting_erode_size=clamp_int(alpha_matting_erode_size, 0, 50),
-        )
+        mode = (segmentation_mode or "auto").strip().lower()
+        chosen_mode = "unknown"
 
-        rgba_pil = ensure_rgba(cutout_png)
-        rgba = np.array(rgba_pil)  # RGBA uint8
+        async def _do_process():
+            nonlocal uniform_alpha, uniform_rgba, rembg_rgba, chosen_rgba, chosen_mode
 
-        # --- Alpha shaping (keep crisp to avoid halo) ---
-        a = rgba[:, :, 3]
-        a = erode(a, clamp_int(edge_erode_px, 0, 30))
-        a = dilate(a, clamp_int(edge_dilate_px, 0, 30))
-        a = feather(a, clamp_int(edge_feather_px, 0, 30))
-        rgba[:, :, 3] = a
+            if mode in ("auto", "uniform_bg"):
+                uniform_alpha_local, _ = uniform_background_mask(
+                    rgb,
+                    bg_tolerance=clamp_int(uniform_bg_tolerance, 1, 120),
+                    patch_frac=clamp_float(uniform_bg_corner_patch_frac, 0.02, 0.2),
+                    corner_uniformity_max_std=clamp_float(uniform_bg_max_corner_std, 1.0, 80.0),
+                )
+                if uniform_alpha_local is not None:
+                    uniform_alpha = uniform_alpha_local
+                    uniform_rgba = rgba_from_rgb_alpha(rgb, uniform_alpha)
 
-        # --- RGB decontamination on semi-transparent edge band ---
-        if decontaminate:
-            rgba = decontaminate_edge_rgb(
-                rgba,
-                alpha_max=clamp_int(decontaminate_alpha_max, 1, 254),
-                inpaint_radius=clamp_int(decontaminate_inpaint_radius, 1, 12),
+            if mode in ("auto", "rembg"):
+                rembg_rgba = rembg_cutout(
+                    pil_img,
+                    alpha_matting=bool(alpha_matting),
+                    alpha_matting_foreground_threshold=alpha_matting_foreground_threshold,
+                    alpha_matting_background_threshold=alpha_matting_background_threshold,
+                    alpha_matting_erode_size=alpha_matting_erode_size,
+                )
+
+            chosen_rgba_local, chosen_mode_local = pick_best_cutout(
+                rgb=rgb,
+                uniform_rgba=uniform_rgba,
+                rembg_rgba=rembg_rgba,
+                prefer_uniform_bg=bool(prefer_uniform_bg),
             )
+            chosen_rgba = chosen_rgba_local
+            chosen_mode = chosen_mode_local
+
+        await asyncio.wait_for(_do_process(), timeout=PROCESS_TIMEOUT_S)
+
+        chosen_rgba = apply_edge_postprocess(
+            chosen_rgba,
+            edge_erode_px=edge_erode_px,
+            edge_dilate_px=edge_dilate_px,
+            edge_feather_px=edge_feather_px,
+            decontaminate=decontaminate,
+            decontaminate_alpha_max=decontaminate_alpha_max,
+            decontaminate_inpaint_radius=decontaminate_inpaint_radius,
+        )
 
         tw = clamp_int(target_w, 200, 6000)
         th = clamp_int(target_h, 200, 8000)
         fitted = object_aware_fit(
-            rgba,
+            chosen_rgba,
             target_w=tw,
             target_h=th,
             padding_ratio=float(padding_ratio),
@@ -371,33 +576,43 @@ async def process_image(
 
         filename = build_filename(prefix=prefix, mpn=mpn, sku=sku, ext=ext)
 
+        headers = {
+            "Content-Disposition": f'inline; filename="{filename}"',
+            "Cache-Control": "no-store",
+        }
+
+        if debug_headers:
+            headers["X-Segmentation-Mode"] = chosen_mode
+
         return Response(
             content=out_bytes,
             media_type=media_type,
-            headers={
-                "Content-Disposition": f'inline; filename="{filename}"',
-                # Helps avoid browser caching while you're iterating
-                "Cache-Control": "no-store",
-            },
+            headers=headers,
         )
 
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            {"error": "processing timeout", "hint": "Try segmentation_mode=uniform_bg or disable alpha_matting"},
+            status_code=504,
+        )
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
     finally:
-        # Always release semaphore + aggressively free memory between requests
         try:
             SEM.release()
         except Exception:
             pass
 
-        # Drop big objects
         try:
-            del rgba
-            del fitted
+            del raw
             del pil_img
-            del rgba_pil
-            del tmp
+            del rgb
+            del uniform_alpha
+            del uniform_rgba
+            del rembg_rgba
+            del chosen_rgba
+            del fitted
         except Exception:
             pass
 
