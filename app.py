@@ -34,7 +34,7 @@ SELF_RESTART_SECONDS = int(os.getenv("SELF_RESTART_SECONDS", "600"))
 # App + model session
 # ----------------------------
 
-app = FastAPI(title="image-processor", version="2.3.0")
+app = FastAPI(title="image-processor", version="2.4.0")
 
 REMBG_MODEL = os.getenv("REMBG_MODEL", "isnet-general-use")
 _session = None
@@ -65,9 +65,15 @@ def clamp_int(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, int(v)))
 
 
+def clamp_float(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, float(v)))
+
+
 def pil_open_rgb(data: bytes) -> Image.Image:
     img = Image.open(io.BytesIO(data))
     if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGB")
+    elif img.mode == "RGBA":
         img = img.convert("RGB")
     return img
 
@@ -131,8 +137,7 @@ def object_aware_fit(
     padding_ratio: float = 0.02,
     alpha_thresh: int = 8,
 ) -> np.ndarray:
-    pad = float(padding_ratio)
-    pad = max(0.0, min(0.49, pad))
+    pad = clamp_float(padding_ratio, 0.0, 0.49)
 
     alpha = rgba[:, :, 3]
     bbox = alpha_bbox(alpha, thresh=alpha_thresh)
@@ -198,6 +203,34 @@ def save_png(rgba_arr: np.ndarray) -> bytes:
     return buf.getvalue()
 
 
+def boost_edge_contrast(
+    img: Image.Image,
+    clahe_clip_limit: float = 2.0,
+    clahe_tile_size: int = 8,
+    saturation_boost: float = 1.08,
+) -> Image.Image:
+    arr = np.array(img)
+
+    lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+
+    clahe = cv2.createCLAHE(
+        clipLimit=max(1.0, float(clahe_clip_limit)),
+        tileGridSize=(max(2, int(clahe_tile_size)), max(2, int(clahe_tile_size))),
+    )
+    l = clahe.apply(l)
+
+    lab = cv2.merge((l, a, b))
+    enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+
+    if abs(float(saturation_boost) - 1.0) > 1e-6:
+        hsv = cv2.cvtColor(enhanced, cv2.COLOR_RGB2HSV).astype(np.float32)
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * float(saturation_boost), 0, 255)
+        enhanced = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+
+    return Image.fromarray(enhanced)
+
+
 def decontaminate_edge_rgb(
     rgba: np.ndarray,
     alpha_min: int = 8,
@@ -210,7 +243,12 @@ def decontaminate_edge_rgb(
         return rgba
 
     rgb = rgba[:, :, :3]
-    rgb_fixed = cv2.inpaint(rgb, mask, inpaintRadius=inpaint_radius, flags=cv2.INPAINT_TELEA)
+    rgb_fixed = cv2.inpaint(
+        rgb,
+        mask,
+        inpaintRadius=max(1, int(inpaint_radius)),
+        flags=cv2.INPAINT_TELEA,
+    )
     out = rgba.copy()
     out[:, :, :3] = rgb_fixed
     return out
@@ -238,8 +276,8 @@ async def process_image(
     output: str = Form("webp"),
 
     alpha_matting: bool = Form(True),
-    alpha_matting_foreground_threshold: int = Form(245),
-    alpha_matting_background_threshold: int = Form(12),
+    alpha_matting_foreground_threshold: int = Form(235),
+    alpha_matting_background_threshold: int = Form(20),
     alpha_matting_erode_size: int = Form(1),
 
     edge_erode_px: int = Form(0),
@@ -257,6 +295,11 @@ async def process_image(
 
     pre_upscale: bool = Form(True),
     pre_upscale_min_dim: int = Form(1100),
+
+    enhance_contrast: bool = Form(True),
+    clahe_clip_limit: float = Form(2.0),
+    clahe_tile_size: int = Form(8),
+    saturation_boost: float = Form(1.08),
 ):
     try:
         await asyncio.wait_for(SEM.acquire(), timeout=QUEUE_TIMEOUT_S)
@@ -291,7 +334,18 @@ async def process_image(
             pil_img = pil_img.resize((int(w * scale), int(h * scale)), Image.BICUBIC)
 
         if pre_upscale:
-            pil_img = pre_upscale_if_small(pil_img, min_max_dim=clamp_int(pre_upscale_min_dim, 256, 2400))
+            pil_img = pre_upscale_if_small(
+                pil_img,
+                min_max_dim=clamp_int(pre_upscale_min_dim, 256, 2400),
+            )
+
+        if enhance_contrast:
+            pil_img = boost_edge_contrast(
+                pil_img,
+                clahe_clip_limit=clamp_float(clahe_clip_limit, 1.0, 6.0),
+                clahe_tile_size=clamp_int(clahe_tile_size, 2, 32),
+                saturation_boost=clamp_float(saturation_boost, 1.0, 1.5),
+            )
 
         tmp = io.BytesIO()
         pil_img.save(tmp, format="PNG")
