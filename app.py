@@ -34,7 +34,7 @@ SELF_RESTART_SECONDS = int(os.getenv("SELF_RESTART_SECONDS", "600"))
 # App + model session
 # -------------------------------------------------
 
-app = FastAPI(title="image-processor", version="4.4.0")
+app = FastAPI(title="image-processor", version="4.5.0")
 
 REMBG_MODEL = os.getenv("REMBG_MODEL", "isnet-general-use")
 TARGET_W = int(os.getenv("TARGET_W", "1400"))
@@ -344,9 +344,9 @@ def mask_score(mask: np.ndarray) -> float:
     return score
 
 
-def sample_background_color(rgb: np.ndarray) -> np.ndarray:
+def sample_background_color_corners(rgb: np.ndarray) -> np.ndarray:
     """
-    Estimate background colour from corner patches.
+    Fallback: estimate background colour from image corner patches.
     Returns a (1, 1, 3) float32 array.
     """
     h, w = rgb.shape[:2]
@@ -360,23 +360,49 @@ def sample_background_color(rgb: np.ndarray) -> np.ndarray:
     return corners.mean(axis=0).reshape(1, 1, 3)
 
 
-def decontaminate_rgba(rgb: np.ndarray, alpha: np.ndarray, bg_color: np.ndarray) -> np.ndarray:
+def sample_background_color(rgb: np.ndarray, alpha: Optional[np.ndarray] = None) -> np.ndarray:
     """
-    Remove background colour contamination from semi-transparent edge pixels.
+    Estimate background colour.
 
-    rembg's alpha matting leaves edge pixels whose RGB is a blend of the real
-    object colour and the background.  This reverses that blend so the RGB
-    under partially-transparent pixels reflects the true object colour,
-    eliminating the grey/white halo when composited on any surface.
+    Primary method: sample pixels where rembg is certain they are background
+    (alpha == 0).  These pixels are the actual background immediately
+    surrounding the object — far more accurate than corners for estimating
+    the colour that contaminates edge pixels.
 
-    Formula (straight-alpha colour unmix):
-        true_fg = (blended - bg * (1 - a)) / a
+    Falls back to corner sampling if too few definite-bg pixels exist.
+    """
+    if alpha is not None:
+        bg_pixels = rgb[alpha == 0].astype(np.float32)
+        if len(bg_pixels) >= 200:
+            return bg_pixels.mean(axis=0).reshape(1, 1, 3)
 
-    Only applied in the feathered transition zone (4 % < alpha < 96 %).
+    return sample_background_color_corners(rgb)
+
+
+def decontaminate_rgba(
+    rgb: np.ndarray,
+    alpha: np.ndarray,
+    bg_color: np.ndarray,
+) -> np.ndarray:
+    """
+    Remove background colour contamination from semi-transparent edge pixels,
+    then suppress residual halo pixels whose colour remains close to the
+    background after decontamination.
+
+    Two-pass approach:
+      Pass 1 — colour unmix (straighten the pre-multiplied blend):
+          true_fg = (blended_rgb - bg * (1 - a)) / a
+      Pass 2 — halo suppression:
+          Pixels still close to bg colour after unmixing have their alpha
+          driven toward 0 proportionally to how bg-like they are.
+          This kills the grey "fog" that persists after plain unmixing.
     """
     alpha_f = alpha.astype(np.float32) / 255.0
     rgb_f = rgb.astype(np.float32)
 
+    # ------------------------------------------------------------------
+    # Pass 1: colour unmix in the feathered transition zone
+    # ------------------------------------------------------------------
     safe_alpha = np.maximum(alpha_f, 0.001)[..., np.newaxis]
     decontaminated = (rgb_f - bg_color * (1.0 - alpha_f[..., np.newaxis])) / safe_alpha
     decontaminated = np.clip(decontaminated, 0, 255)
@@ -384,21 +410,40 @@ def decontaminate_rgba(rgb: np.ndarray, alpha: np.ndarray, bg_color: np.ndarray)
     transition = (alpha_f > 0.04) & (alpha_f < 0.96)
     result_rgb = rgb_f.copy()
     result_rgb[transition] = decontaminated[transition]
-    result_rgb = np.clip(result_rgb, 0, 255).astype(np.uint8)
+    result_rgb = np.clip(result_rgb, 0, 255)
 
-    return np.dstack([result_rgb, alpha])
+    # ------------------------------------------------------------------
+    # Pass 2: halo suppression
+    # Pixels whose colour — even after unmixing — is still close to the
+    # background get their alpha scaled down toward zero.
+    # Threshold of 30 in Euclidean RGB catches grey/white halos without
+    # touching genuinely light-coloured parts of the object.
+    # ------------------------------------------------------------------
+    dist_to_bg = np.sqrt(np.sum((result_rgb - bg_color) ** 2, axis=2))
+
+    # Scale factor: 0.0 when dist==0 (pure bg), 1.0 when dist>=halo_thresh (safe fg)
+    halo_thresh = 30.0
+    halo_scale = np.clip(dist_to_bg / halo_thresh, 0.0, 1.0)
+
+    # Only apply suppression in the uncertain zone (alpha < 0.85)
+    # so solid object pixels are never touched
+    suppress_zone = alpha_f < 0.85
+    alpha_f_out = alpha_f.copy()
+    alpha_f_out[suppress_zone] *= halo_scale[suppress_zone]
+
+    # Snap very low residual alpha to 0 to avoid near-invisible fog
+    alpha_f_out[alpha_f_out < 0.04] = 0.0
+
+    result_alpha = np.clip(alpha_f_out * 255.0, 0, 255).astype(np.uint8)
+    result_rgb_u8 = result_rgb.clip(0, 255).astype(np.uint8)
+
+    return np.dstack([result_rgb_u8, result_alpha])
 
 
 def rembg_rgba(rgb: np.ndarray) -> np.ndarray:
     """
     Run rembg and return a full RGBA array, preserving the neural-net's
-    smooth alpha channel.
-
-    Critical insight: rembg with alpha_matting=True already produces a
-    high-quality feathered alpha.  Previous versions binarised this at >8
-    and re-feathered with GaussianBlur, which destroyed the smooth matting
-    and produced jagged white fringe edges.  We now use the alpha as-is
-    and only apply colour decontamination on top.
+    smooth alpha channel rather than binarising and re-feathering it.
     """
     pil_img = Image.fromarray(rgb, mode="RGB")
     buf = io.BytesIO()
@@ -409,9 +454,9 @@ def rembg_rgba(rgb: np.ndarray) -> np.ndarray:
         png_in,
         session=_session,
         alpha_matting=True,
-        alpha_matting_foreground_threshold=230,   # was 245
-        alpha_matting_background_threshold=15,    # was 12
-        alpha_matting_erode_size=2,               # was 1
+        alpha_matting_foreground_threshold=230,
+        alpha_matting_background_threshold=15,
+        alpha_matting_erode_size=2,
     )
 
     rgba_pil = ensure_rgba(cutout_png)
@@ -421,7 +466,7 @@ def rembg_rgba(rgb: np.ndarray) -> np.ndarray:
 def build_rgba_from_floodfill(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """
     Build RGBA from a binary floodfill mask with smooth feather +
-    background decontamination.  Used only when floodfill beats rembg.
+    decontamination.  Used only when floodfill beats rembg on scoring.
     """
     mask_u8 = (mask.astype(np.uint8) * 255)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -429,7 +474,7 @@ def build_rgba_from_floodfill(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
     alpha = cv2.GaussianBlur(mask_eroded, (7, 7), 0)
     alpha = np.clip(alpha, 0, 255).astype(np.uint8)
 
-    bg_color = sample_background_color(rgb)
+    bg_color = sample_background_color_corners(rgb)
     return decontaminate_rgba(rgb, alpha, bg_color)
 
 
@@ -480,19 +525,22 @@ def choose_best_rgba(rgb: np.ndarray) -> np.ndarray:
     """
     Decide between floodfill and rembg, then return a clean RGBA array.
 
-    Key change vs previous versions:
-    - rembg path returns RGBA directly (neural-net alpha preserved) and
-      only applies decontamination — no binarise/re-feather step.
-    - floodfill only wins when it scores clearly better than rembg.
+    rembg path:
+      1. Run rembg with alpha matting — preserve the neural-net alpha as-is
+      2. Sample bg colour from rembg's definite-background pixels (alpha==0)
+         for maximum accuracy near edges
+      3. Decontaminate edge pixels (colour unmix) then suppress residual halo
+         pixels whose colour is still close to background
+
+    floodfill path (only when it clearly wins on score):
+      Build feathered alpha from binary mask + corner-based decontamination
     """
     h, w = rgb.shape[:2]
     max_dim = max(h, w)
 
     stats = corner_patch_stats(rgb)
     flat_bg = is_flat_background(stats, max_dim)
-    bg_color = sample_background_color(rgb)
 
-    # --- Attempt floodfill when background looks uniform ---
     ff_mask = None
     ff_score = -999.0
 
@@ -504,7 +552,7 @@ def choose_best_rgba(rgb: np.ndarray) -> np.ndarray:
             ff_mask = None
             ff_score = -999.0
 
-    # --- Always run rembg, get smooth RGBA directly ---
+    # Run rembg — returns RGBA with smooth neural-net alpha
     rb_rgba = rembg_rgba(rgb)
     rb_alpha = rb_rgba[:, :, 3]
 
@@ -515,11 +563,11 @@ def choose_best_rgba(rgb: np.ndarray) -> np.ndarray:
     rb_mask_bin = largest_component(rb_mask_bin)
     rb_score = mask_score(rb_mask_bin)
 
-    # --- Pick winner ---
     if ff_mask is not None and ff_score >= rb_score + 0.5:
         return build_rgba_from_floodfill(rgb, ff_mask)
 
-    # rembg wins: decontaminate its alpha in-place, do NOT re-feather
+    # rembg wins: sample bg from definite-background pixels in rembg output
+    bg_color = sample_background_color(rgb, alpha=rb_alpha)
     return decontaminate_rgba(rb_rgba[:, :, :3], rb_alpha, bg_color)
 
 
@@ -543,7 +591,7 @@ def health():
         "ok": True,
         "model": REMBG_MODEL,
         "max_concurrency": MAX_CONCURRENCY,
-        "version": "4.4.0",
+        "version": "4.5.0",
     }
 
 
