@@ -1,8 +1,9 @@
 fastapi
 uvicorn[standard]
 python-multipart
-rembg
-onnxruntime
+transparent-background
+torch
+torchvision
 pillow
 opencv-python-headless
 numpy
