@@ -12,10 +12,6 @@ from PIL import Image
 
 from rembg import remove, new_session
 
-# ----------------------------
-# Stability / performance knobs
-# ----------------------------
-
 try:
     cv2.setNumThreads(1)
 except Exception:
@@ -30,11 +26,7 @@ QUEUE_TIMEOUT_S = float(os.getenv("QUEUE_TIMEOUT_S", "15"))
 ENABLE_SELF_RESTART = os.getenv("ENABLE_SELF_RESTART", "0") == "1"
 SELF_RESTART_SECONDS = int(os.getenv("SELF_RESTART_SECONDS", "600"))
 
-# ----------------------------
-# App + model session
-# ----------------------------
-
-app = FastAPI(title="image-processor", version="2.4.0")
+app = FastAPI(title="image-processor", version="3.0.0")
 
 REMBG_MODEL = os.getenv("REMBG_MODEL", "isnet-general-use")
 _session = None
@@ -56,7 +48,7 @@ async def _startup():
     if ENABLE_SELF_RESTART:
         async def _restarter():
             await asyncio.sleep(max(60, SELF_RESTART_SECONDS))
-            os._exit(0)  # noqa: S606
+            os._exit(0)
 
         asyncio.create_task(_restarter())
 
@@ -71,22 +63,9 @@ def clamp_float(v: float, lo: float, hi: float) -> float:
 
 def pil_open_rgb(data: bytes) -> Image.Image:
     img = Image.open(io.BytesIO(data))
-    if img.mode not in ("RGB", "RGBA"):
-        img = img.convert("RGB")
-    elif img.mode == "RGBA":
+    if img.mode != "RGB":
         img = img.convert("RGB")
     return img
-
-
-def pre_upscale_if_small(img: Image.Image, min_max_dim: int = 1100) -> Image.Image:
-    w, h = img.size
-    m = max(w, h)
-    if m >= min_max_dim:
-        return img
-    scale = min_max_dim / float(m)
-    new_w = int(round(w * scale))
-    new_h = int(round(h * scale))
-    return img.resize((new_w, new_h), Image.BICUBIC)
 
 
 def ensure_rgba(png_bytes: bytes) -> Image.Image:
@@ -96,27 +75,28 @@ def ensure_rgba(png_bytes: bytes) -> Image.Image:
     return im
 
 
-def dilate(alpha: np.ndarray, px: int) -> np.ndarray:
-    if px <= 0:
-        return alpha
-    k = 2 * px + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    return cv2.dilate(alpha, kernel, iterations=1)
+def build_filename(prefix: str, mpn: str, sku: str, ext: str) -> str:
+    def clean(s: str) -> str:
+        s = (s or "").strip()
+        s = s.replace(" ", "_")
+        s = "".join(ch for ch in s if ch.isalnum() or ch in ("_", "-", "."))
+        return s[:140] if s else "na"
+
+    return f"{clean(prefix)}_{clean(mpn)}_{clean(sku)}.{ext}"
 
 
-def erode(alpha: np.ndarray, px: int) -> np.ndarray:
-    if px <= 0:
-        return alpha
-    k = 2 * px + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    return cv2.erode(alpha, kernel, iterations=1)
+def save_lossless_webp(rgba_arr: np.ndarray) -> bytes:
+    img = Image.fromarray(rgba_arr, mode="RGBA")
+    buf = io.BytesIO()
+    img.save(buf, format="WEBP", lossless=True, quality=100, method=6)
+    return buf.getvalue()
 
 
-def feather(alpha: np.ndarray, px: int) -> np.ndarray:
-    if px <= 0:
-        return alpha
-    k = 2 * px + 1
-    return cv2.GaussianBlur(alpha, (k, k), 0)
+def save_png(rgba_arr: np.ndarray) -> bytes:
+    img = Image.fromarray(rgba_arr, mode="RGBA")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=False)
+    return buf.getvalue()
 
 
 def alpha_bbox(alpha: np.ndarray, thresh: int = 8) -> Optional[Tuple[int, int, int, int]]:
@@ -148,10 +128,8 @@ def object_aware_fit(
     obj = rgba[y1:y2, x1:x2, :]
 
     obj_h, obj_w = obj.shape[:2]
-    inner_w = int(round(target_w * (1.0 - 2.0 * pad)))
-    inner_h = int(round(target_h * (1.0 - 2.0 * pad)))
-    inner_w = max(1, inner_w)
-    inner_h = max(1, inner_h)
+    inner_w = max(1, int(round(target_w * (1.0 - 2.0 * pad))))
+    inner_h = max(1, int(round(target_h * (1.0 - 2.0 * pad))))
 
     scale = min(inner_w / obj_w, inner_h / obj_h)
     new_w = max(1, int(round(obj_w * scale)))
@@ -160,7 +138,6 @@ def object_aware_fit(
     obj_resized = cv2.resize(obj, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
 
     out = np.zeros((target_h, target_w, 4), dtype=np.uint8)
-
     x0 = (target_w - new_w) // 2
     y0 = (target_h - new_h) // 2
 
@@ -179,84 +156,239 @@ def object_aware_fit(
     return out
 
 
-def build_filename(prefix: str, mpn: str, sku: str, ext: str) -> str:
-    def clean(s: str) -> str:
-        s = (s or "").strip()
-        s = s.replace(" ", "_")
-        s = "".join(ch for ch in s if ch.isalnum() or ch in ("_", "-", "."))
-        return s[:140] if s else "na"
-
-    return f"{clean(prefix)}_{clean(mpn)}_{clean(sku)}.{ext}"
+def dynamic_corner_patch_size(h: int, w: int) -> int:
+    return max(6, min(40, int(round(min(h, w) * 0.03))))
 
 
-def save_lossless_webp(rgba_arr: np.ndarray) -> bytes:
-    img = Image.fromarray(rgba_arr, mode="RGBA")
-    buf = io.BytesIO()
-    img.save(buf, format="WEBP", lossless=True, quality=100, method=6)
-    return buf.getvalue()
+def sample_corner_pixels(rgb: np.ndarray) -> np.ndarray:
+    h, w = rgb.shape[:2]
+    p = dynamic_corner_patch_size(h, w)
+
+    patches = [
+        rgb[0:p, 0:p],
+        rgb[0:p, w - p:w],
+        rgb[h - p:h, 0:p],
+        rgb[h - p:h, w - p:w],
+    ]
+    return np.concatenate([x.reshape(-1, 3) for x in patches], axis=0)
 
 
-def save_png(rgba_arr: np.ndarray) -> bytes:
-    img = Image.fromarray(rgba_arr, mode="RGBA")
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=False)
-    return buf.getvalue()
+def background_stats_from_corners(rgb: np.ndarray) -> Tuple[np.ndarray, float, bool]:
+    corner_pixels = sample_corner_pixels(rgb).astype(np.uint8)
+    corner_lab = cv2.cvtColor(corner_pixels.reshape(-1, 1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3)
+
+    mean_lab = corner_lab.mean(axis=0).astype(np.float32)
+    spread = float(np.mean(np.std(corner_lab.astype(np.float32), axis=0)))
+    uniform = spread <= 10.5
+    return mean_lab, spread, uniform
 
 
-def boost_edge_contrast(
-    img: Image.Image,
-    clahe_clip_limit: float = 2.0,
-    clahe_tile_size: int = 8,
-    saturation_boost: float = 1.08,
-) -> Image.Image:
-    arr = np.array(img)
+def mask_connected_to_border(candidate: np.ndarray) -> np.ndarray:
+    candidate_u8 = candidate.astype(np.uint8)
+    num_labels, labels = cv2.connectedComponents(candidate_u8, connectivity=4)
 
-    lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
-    l, a, b = cv2.split(lab)
+    if num_labels <= 1:
+        return np.zeros_like(candidate_u8, dtype=bool)
 
-    clahe = cv2.createCLAHE(
-        clipLimit=max(1.0, float(clahe_clip_limit)),
-        tileGridSize=(max(2, int(clahe_tile_size)), max(2, int(clahe_tile_size))),
+    border_labels = set()
+    if candidate_u8[0, :].any():
+        border_labels.update(np.unique(labels[0, candidate_u8[0, :] > 0]).tolist())
+    if candidate_u8[-1, :].any():
+        border_labels.update(np.unique(labels[-1, candidate_u8[-1, :] > 0]).tolist())
+    if candidate_u8[:, 0].any():
+        border_labels.update(np.unique(labels[candidate_u8[:, 0] > 0, 0]).tolist())
+    if candidate_u8[:, -1].any():
+        border_labels.update(np.unique(labels[candidate_u8[:, -1] > 0, -1]).tolist())
+
+    border_labels.discard(0)
+    if not border_labels:
+        return np.zeros_like(candidate_u8, dtype=bool)
+
+    bg = np.isin(labels, list(border_labels))
+    return bg
+
+
+def cleanup_binary_mask(mask: np.ndarray, max_dim: int) -> np.ndarray:
+    mask_u8 = (mask.astype(np.uint8) * 255)
+
+    if max_dim < 700:
+        k_open = 0
+        k_close = 1
+    elif max_dim < 1600:
+        k_open = 1
+        k_close = 2
+    else:
+        k_open = 1
+        k_close = 3
+
+    if k_open > 0:
+        ko = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k_open + 1, 2 * k_open + 1))
+        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, ko)
+
+    if k_close > 0:
+        kc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k_close + 1, 2 * k_close + 1))
+        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kc)
+
+    return mask_u8 > 0
+
+
+def keep_largest_component(mask: np.ndarray) -> np.ndarray:
+    mask_u8 = mask.astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+    if num_labels <= 1:
+        return mask
+
+    largest_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    return labels == largest_label
+
+
+def rembg_mask(rgb: np.ndarray) -> np.ndarray:
+    pil_img = Image.fromarray(rgb, mode="RGB")
+    tmp = io.BytesIO()
+    pil_img.save(tmp, format="PNG")
+    png_in = tmp.getvalue()
+
+    cutout_png = remove(
+        png_in,
+        session=_session,
+        alpha_matting=True,
+        alpha_matting_foreground_threshold=245,
+        alpha_matting_background_threshold=12,
+        alpha_matting_erode_size=1,
     )
-    l = clahe.apply(l)
 
-    lab = cv2.merge((l, a, b))
-    enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-
-    if abs(float(saturation_boost) - 1.0) > 1e-6:
-        hsv = cv2.cvtColor(enhanced, cv2.COLOR_RGB2HSV).astype(np.float32)
-        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * float(saturation_boost), 0, 255)
-        enhanced = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
-
-    return Image.fromarray(enhanced)
+    rgba_pil = ensure_rgba(cutout_png)
+    rgba = np.array(rgba_pil)
+    return rgba[:, :, 3] > 8
 
 
-def decontaminate_edge_rgb(
-    rgba: np.ndarray,
-    alpha_min: int = 8,
-    alpha_max: int = 160,
-    inpaint_radius: int = 4,
-) -> np.ndarray:
-    alpha = rgba[:, :, 3]
-    mask = ((alpha >= alpha_min) & (alpha <= alpha_max)).astype(np.uint8) * 255
-    if mask.max() == 0:
-        return rgba
+def floodfill_mask(rgb: np.ndarray) -> Tuple[np.ndarray, dict]:
+    h, w = rgb.shape[:2]
+    max_dim = max(h, w)
 
-    rgb = rgba[:, :, :3]
-    rgb_fixed = cv2.inpaint(
-        rgb,
-        mask,
-        inpaintRadius=max(1, int(inpaint_radius)),
-        flags=cv2.INPAINT_TELEA,
-    )
-    out = rgba.copy()
-    out[:, :, :3] = rgb_fixed
-    return out
+    mean_lab, spread, uniform = background_stats_from_corners(rgb)
+
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    dist = np.sqrt(np.sum((lab - mean_lab.reshape(1, 1, 3)) ** 2, axis=2))
+
+    if max_dim < 700:
+        base_tol = 16.0
+    elif max_dim < 1600:
+        base_tol = 18.0
+    else:
+        base_tol = 20.0
+
+    tol = clamp_float(base_tol + (spread * 1.5), 12.0, 34.0)
+
+    candidate_bg = dist <= tol
+    bg_mask = mask_connected_to_border(candidate_bg)
+    fg_mask = ~bg_mask
+
+    fg_mask = cleanup_binary_mask(fg_mask, max_dim)
+    fg_mask = keep_largest_component(fg_mask)
+
+    meta = {
+        "corner_spread": spread,
+        "uniform_bg": uniform,
+        "tolerance": tol,
+    }
+    return fg_mask, meta
+
+
+def touches_border(mask: np.ndarray) -> float:
+    if mask.size == 0:
+        return 0.0
+    border = np.concatenate([mask[0, :], mask[-1, :], mask[:, 0], mask[:, -1]])
+    return float(np.mean(border.astype(np.float32)))
+
+
+def largest_component_ratio(mask: np.ndarray) -> float:
+    mask_u8 = mask.astype(np.uint8)
+    total = int(mask_u8.sum())
+    if total == 0:
+        return 0.0
+
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+    if num_labels <= 1:
+        return 0.0
+
+    largest = int(stats[1:, cv2.CC_STAT_AREA].max())
+    return float(largest) / float(total)
+
+
+def mask_score(mask: np.ndarray, prefer_uniform_bg: bool = False, uniform_bg: bool = False) -> float:
+    area_ratio = float(mask.mean())
+    border_touch = touches_border(mask)
+    component_ratio = largest_component_ratio(mask)
+
+    score = 0.0
+
+    if 0.03 <= area_ratio <= 0.90:
+        score += 2.5
+    elif 0.01 <= area_ratio <= 0.97:
+        score += 1.0
+    else:
+        score -= 3.0
+
+    if border_touch <= 0.02:
+        score += 2.0
+    elif border_touch <= 0.08:
+        score += 1.0
+    else:
+        score -= 2.0
+
+    if component_ratio >= 0.90:
+        score += 2.0
+    elif component_ratio >= 0.75:
+        score += 1.0
+    else:
+        score -= 1.0
+
+    if prefer_uniform_bg and uniform_bg:
+        score += 1.0
+
+    return score
+
+
+def build_rgba(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    alpha = (mask.astype(np.uint8) * 255)
+    rgba = np.dstack([rgb, alpha]).astype(np.uint8)
+    return rgba
+
+
+def choose_best_mask(rgb: np.ndarray) -> np.ndarray:
+    ff_mask, ff_meta = floodfill_mask(rgb)
+    ff_score = mask_score(ff_mask, prefer_uniform_bg=True, uniform_bg=ff_meta["uniform_bg"])
+
+    try:
+        rb_mask = rembg_mask(rgb)
+        rb_mask = cleanup_binary_mask(rb_mask, max(rgb.shape[:2]))
+        rb_mask = keep_largest_component(rb_mask)
+        rb_score = mask_score(rb_mask)
+    except Exception:
+        rb_mask = np.zeros(rgb.shape[:2], dtype=bool)
+        rb_score = -999.0
+
+    if ff_meta["uniform_bg"] and ff_score >= 3.0:
+        return ff_mask
+
+    if rb_score > ff_score + 0.5:
+        return rb_mask
+
+    if ff_score >= rb_score:
+        return ff_mask
+
+    return rb_mask
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "model": REMBG_MODEL, "max_concurrency": MAX_CONCURRENCY}
+    return {
+        "ok": True,
+        "model": REMBG_MODEL,
+        "max_concurrency": MAX_CONCURRENCY,
+        "version": "3.0.0",
+    }
 
 
 @app.get("/ready")
@@ -269,37 +401,10 @@ def ready():
 @app.post("/process")
 async def process_image(
     file: UploadFile = File(...),
-
     mpn: str = Form(""),
     sku: str = Form(""),
     prefix: str = Form("partlogic"),
     output: str = Form("webp"),
-
-    alpha_matting: bool = Form(True),
-    alpha_matting_foreground_threshold: int = Form(235),
-    alpha_matting_background_threshold: int = Form(20),
-    alpha_matting_erode_size: int = Form(1),
-
-    edge_erode_px: int = Form(0),
-    edge_dilate_px: int = Form(0),
-    edge_feather_px: int = Form(0),
-
-    decontaminate: bool = Form(True),
-    decontaminate_alpha_min: int = Form(8),
-    decontaminate_alpha_max: int = Form(160),
-    decontaminate_inpaint_radius: int = Form(4),
-
-    padding_ratio: float = Form(0.02),
-    target_w: int = Form(TARGET_W),
-    target_h: int = Form(TARGET_H),
-
-    pre_upscale: bool = Form(True),
-    pre_upscale_min_dim: int = Form(1100),
-
-    enhance_contrast: bool = Form(True),
-    clahe_clip_limit: float = Form(2.0),
-    clahe_tile_size: int = Form(8),
-    saturation_boost: float = Form(1.08),
 ):
     try:
         await asyncio.wait_for(SEM.acquire(), timeout=QUEUE_TIMEOUT_S)
@@ -309,11 +414,11 @@ async def process_image(
             status_code=503,
         )
 
+    pil_img = None
+    rgb = None
+    mask = None
     rgba = None
     fitted = None
-    pil_img = None
-    rgba_pil = None
-    tmp = None
 
     try:
         if _session is None:
@@ -328,62 +433,23 @@ async def process_image(
         pil_img = pil_open_rgb(raw)
 
         w, h = pil_img.size
-        max_dim = int(os.getenv("MAX_IMAGE_DIM", "8000"))
-        if max(w, h) > max_dim:
-            scale = max_dim / float(max(w, h))
-            pil_img = pil_img.resize((int(w * scale), int(h * scale)), Image.BICUBIC)
+        max_dim_cap = int(os.getenv("MAX_IMAGE_DIM", "8000"))
+        if max(w, h) > max_dim_cap:
+            scale = max_dim_cap / float(max(w, h))
+            pil_img = pil_img.resize((int(round(w * scale)), int(round(h * scale))), Image.LANCZOS)
 
-        if pre_upscale:
-            pil_img = pre_upscale_if_small(
-                pil_img,
-                min_max_dim=clamp_int(pre_upscale_min_dim, 256, 2400),
-            )
+        rgb = np.array(pil_img)
 
-        if enhance_contrast:
-            pil_img = boost_edge_contrast(
-                pil_img,
-                clahe_clip_limit=clamp_float(clahe_clip_limit, 1.0, 6.0),
-                clahe_tile_size=clamp_int(clahe_tile_size, 2, 32),
-                saturation_boost=clamp_float(saturation_boost, 1.0, 1.5),
-            )
+        mask = choose_best_mask(rgb)
+        if mask is None or not mask.any():
+            return JSONResponse({"error": "Failed to extract foreground"}, status_code=422)
 
-        tmp = io.BytesIO()
-        pil_img.save(tmp, format="PNG")
-        png_in = tmp.getvalue()
-
-        cutout_png = remove(
-            png_in,
-            session=_session,
-            alpha_matting=bool(alpha_matting),
-            alpha_matting_foreground_threshold=clamp_int(alpha_matting_foreground_threshold, 0, 255),
-            alpha_matting_background_threshold=clamp_int(alpha_matting_background_threshold, 0, 255),
-            alpha_matting_erode_size=clamp_int(alpha_matting_erode_size, 0, 50),
-        )
-
-        rgba_pil = ensure_rgba(cutout_png)
-        rgba = np.array(rgba_pil)
-
-        a = rgba[:, :, 3]
-        a = erode(a, clamp_int(edge_erode_px, 0, 30))
-        a = dilate(a, clamp_int(edge_dilate_px, 0, 30))
-        a = feather(a, clamp_int(edge_feather_px, 0, 30))
-        rgba[:, :, 3] = a
-
-        if decontaminate:
-            rgba = decontaminate_edge_rgb(
-                rgba,
-                alpha_min=clamp_int(decontaminate_alpha_min, 0, 254),
-                alpha_max=clamp_int(decontaminate_alpha_max, 1, 254),
-                inpaint_radius=clamp_int(decontaminate_inpaint_radius, 1, 12),
-            )
-
-        tw = clamp_int(target_w, 200, 6000)
-        th = clamp_int(target_h, 200, 8000)
+        rgba = build_rgba(rgb, mask)
         fitted = object_aware_fit(
             rgba,
-            target_w=tw,
-            target_h=th,
-            padding_ratio=float(padding_ratio),
+            target_w=TARGET_W,
+            target_h=TARGET_H,
+            padding_ratio=0.02,
             alpha_thresh=8,
         )
 
@@ -418,11 +484,11 @@ async def process_image(
             pass
 
         try:
+            del pil_img
+            del rgb
+            del mask
             del rgba
             del fitted
-            del pil_img
-            del rgba_pil
-            del tmp
         except Exception:
             pass
 
