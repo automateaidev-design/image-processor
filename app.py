@@ -16,23 +16,17 @@ from rembg import remove, new_session
 # Stability / performance knobs
 # ----------------------------
 
-# Prevent OpenCV from spawning huge thread pools (common cause of instability on small containers)
 try:
     cv2.setNumThreads(1)
 except Exception:
     pass
 
-# Prevent Pillow decompression bombs / insane uploads from killing RAM
-# (set via env if you want; default is conservative for e-comm photos)
-PIL_MAX_IMAGE_PIXELS = int(os.getenv("PIL_MAX_IMAGE_PIXELS", "60000000"))  # 60 MP
+PIL_MAX_IMAGE_PIXELS = int(os.getenv("PIL_MAX_IMAGE_PIXELS", "60000000"))
 Image.MAX_IMAGE_PIXELS = PIL_MAX_IMAGE_PIXELS
 
-# Concurrency cap (backpressure) - set to 1..3 for heavy rembg + matting
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "2"))
-QUEUE_TIMEOUT_S = float(os.getenv("QUEUE_TIMEOUT_S", "15"))  # if busy, fail fast
+QUEUE_TIMEOUT_S = float(os.getenv("QUEUE_TIMEOUT_S", "15"))
 
-# Force periodic self-restart (optional; better to use gunicorn --max-requests)
-# Set ENABLE_SELF_RESTART=1 and SELF_RESTART_SECONDS=600 if you really want it.
 ENABLE_SELF_RESTART = os.getenv("ENABLE_SELF_RESTART", "0") == "1"
 SELF_RESTART_SECONDS = int(os.getenv("SELF_RESTART_SECONDS", "600"))
 
@@ -40,10 +34,10 @@ SELF_RESTART_SECONDS = int(os.getenv("SELF_RESTART_SECONDS", "600"))
 # App + model session
 # ----------------------------
 
-app = FastAPI(title="image-processor", version="2.2.0")
+app = FastAPI(title="image-processor", version="2.3.0")
 
-REMBG_MODEL = os.getenv("REMBG_MODEL", "u2net")
-_session = None  # initialized per worker on startup
+REMBG_MODEL = os.getenv("REMBG_MODEL", "isnet-general-use")
+_session = None
 
 TARGET_W = int(os.getenv("TARGET_W", "1400"))
 TARGET_H = int(os.getenv("TARGET_H", "1700"))
@@ -51,26 +45,17 @@ TARGET_H = int(os.getenv("TARGET_H", "1700"))
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
-# Global semaphore for backpressure (per worker)
 SEM = asyncio.Semaphore(max(1, MAX_CONCURRENCY))
 
 
 @app.on_event("startup")
 async def _startup():
-    """
-    Create the rembg session *inside* the worker process.
-    This is more stable with gunicorn preloading/forking and keeps memory predictable.
-    """
     global _session
-
-    # Load model/session once per worker
     _session = new_session(REMBG_MODEL)
 
-    # Optional self-restart loop (only if you turn it on)
     if ENABLE_SELF_RESTART:
         async def _restarter():
             await asyncio.sleep(max(60, SELF_RESTART_SECONDS))
-            # Exiting the process lets Railway/gunicorn restart cleanly (clears RAM)
             os._exit(0)  # noqa: S606
 
         asyncio.create_task(_restarter())
@@ -87,7 +72,7 @@ def pil_open_rgb(data: bytes) -> Image.Image:
     return img
 
 
-def pre_upscale_if_small(img: Image.Image, min_max_dim: int = 900) -> Image.Image:
+def pre_upscale_if_small(img: Image.Image, min_max_dim: int = 1100) -> Image.Image:
     w, h = img.size
     m = max(w, h)
     if m >= min_max_dim:
@@ -143,7 +128,7 @@ def object_aware_fit(
     rgba: np.ndarray,
     target_w: int,
     target_h: int,
-    padding_ratio: float = 0.0,
+    padding_ratio: float = 0.02,
     alpha_thresh: int = 8,
 ) -> np.ndarray:
     pad = float(padding_ratio)
@@ -213,13 +198,14 @@ def save_png(rgba_arr: np.ndarray) -> bytes:
     return buf.getvalue()
 
 
-def decontaminate_edge_rgb(rgba: np.ndarray, alpha_max: int = 200, inpaint_radius: int = 3) -> np.ndarray:
-    """
-    Removes “halo” by fixing RGB values in semi-transparent edge pixels.
-    We inpaint ONLY where alpha is between 1..alpha_max (edge band).
-    """
+def decontaminate_edge_rgb(
+    rgba: np.ndarray,
+    alpha_min: int = 8,
+    alpha_max: int = 160,
+    inpaint_radius: int = 4,
+) -> np.ndarray:
     alpha = rgba[:, :, 3]
-    mask = ((alpha > 0) & (alpha < alpha_max)).astype(np.uint8) * 255
+    mask = ((alpha >= alpha_min) & (alpha <= alpha_max)).astype(np.uint8) * 255
     if mask.max() == 0:
         return rgba
 
@@ -237,8 +223,6 @@ def health():
 
 @app.get("/ready")
 def ready():
-    # Simple readiness: if we can immediately acquire 1 slot, we're "ready".
-    # This prevents callers from piling onto an overloaded instance.
     if SEM.locked():
         return JSONResponse({"ready": False, "reason": "busy"}, status_code=503)
     return {"ready": True}
@@ -251,36 +235,29 @@ async def process_image(
     mpn: str = Form(""),
     sku: str = Form(""),
     prefix: str = Form("partlogic"),
+    output: str = Form("webp"),
 
-    output: str = Form("webp"),  # webp | png
-
-    # Rembg controls (tune in n8n without redeploy)
     alpha_matting: bool = Form(True),
-    # Better defaults for white/industrial products:
-    alpha_matting_foreground_threshold: int = Form(250),
-    alpha_matting_background_threshold: int = Form(15),
-    alpha_matting_erode_size: int = Form(2),
+    alpha_matting_foreground_threshold: int = Form(245),
+    alpha_matting_background_threshold: int = Form(12),
+    alpha_matting_erode_size: int = Form(1),
 
-    # Edge controls (better defaults for crisp ecommerce cutouts)
-    edge_erode_px: int = Form(1),      # 1 is usually enough; 2 can shrink too much
-    edge_dilate_px: int = Form(0),     # keep 0 unless you need thicker edges
-    edge_feather_px: int = Form(0),    # KEEP 0 to avoid grey fringe
+    edge_erode_px: int = Form(0),
+    edge_dilate_px: int = Form(0),
+    edge_feather_px: int = Form(0),
 
-    # Decontaminate edge RGB
     decontaminate: bool = Form(True),
-    decontaminate_alpha_max: int = Form(200),
-    decontaminate_inpaint_radius: int = Form(8),  # 200 is way too high; keep 6-12
+    decontaminate_alpha_min: int = Form(8),
+    decontaminate_alpha_max: int = Form(160),
+    decontaminate_inpaint_radius: int = Form(4),
 
-    # Canvas controls
-    padding_ratio: float = Form(0.0),
+    padding_ratio: float = Form(0.02),
     target_w: int = Form(TARGET_W),
     target_h: int = Form(TARGET_H),
 
-    # Quality/perf
     pre_upscale: bool = Form(True),
-    pre_upscale_min_dim: int = Form(900),
+    pre_upscale_min_dim: int = Form(1100),
 ):
-    # Backpressure: if overloaded, fail fast rather than timing out and wedging n8n
     try:
         await asyncio.wait_for(SEM.acquire(), timeout=QUEUE_TIMEOUT_S)
     except asyncio.TimeoutError:
@@ -297,7 +274,6 @@ async def process_image(
 
     try:
         if _session is None:
-            # Should not happen if startup ran; still guard
             return JSONResponse({"error": "Model session not ready"}, status_code=503)
 
         raw = await file.read()
@@ -308,7 +284,6 @@ async def process_image(
 
         pil_img = pil_open_rgb(raw)
 
-        # Hard cap dimensions to protect RAM if someone uploads a massive image
         w, h = pil_img.size
         max_dim = int(os.getenv("MAX_IMAGE_DIM", "8000"))
         if max(w, h) > max_dim:
@@ -332,19 +307,18 @@ async def process_image(
         )
 
         rgba_pil = ensure_rgba(cutout_png)
-        rgba = np.array(rgba_pil)  # RGBA uint8
+        rgba = np.array(rgba_pil)
 
-        # --- Alpha shaping (keep crisp to avoid halo) ---
         a = rgba[:, :, 3]
         a = erode(a, clamp_int(edge_erode_px, 0, 30))
         a = dilate(a, clamp_int(edge_dilate_px, 0, 30))
         a = feather(a, clamp_int(edge_feather_px, 0, 30))
         rgba[:, :, 3] = a
 
-        # --- RGB decontamination on semi-transparent edge band ---
         if decontaminate:
             rgba = decontaminate_edge_rgb(
                 rgba,
+                alpha_min=clamp_int(decontaminate_alpha_min, 0, 254),
                 alpha_max=clamp_int(decontaminate_alpha_max, 1, 254),
                 inpaint_radius=clamp_int(decontaminate_inpaint_radius, 1, 12),
             )
@@ -376,7 +350,6 @@ async def process_image(
             media_type=media_type,
             headers={
                 "Content-Disposition": f'inline; filename="{filename}"',
-                # Helps avoid browser caching while you're iterating
                 "Cache-Control": "no-store",
             },
         )
@@ -385,13 +358,11 @@ async def process_image(
         return JSONResponse({"error": str(e)}, status_code=500)
 
     finally:
-        # Always release semaphore + aggressively free memory between requests
         try:
             SEM.release()
         except Exception:
             pass
 
-        # Drop big objects
         try:
             del rgba
             del fitted
