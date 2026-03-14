@@ -34,7 +34,7 @@ SELF_RESTART_SECONDS = int(os.getenv("SELF_RESTART_SECONDS", "600"))
 # App + model session
 # -------------------------------------------------
 
-app = FastAPI(title="image-processor", version="4.2.0")
+app = FastAPI(title="image-processor", version="4.3.0")
 
 REMBG_MODEL = os.getenv("REMBG_MODEL", "isnet-general-use")
 TARGET_W = int(os.getenv("TARGET_W", "1400"))
@@ -327,9 +327,9 @@ def rembg_mask(rgb: np.ndarray) -> np.ndarray:
         png_in,
         session=_session,
         alpha_matting=True,
-        alpha_matting_foreground_threshold=245,
-        alpha_matting_background_threshold=12,
-        alpha_matting_erode_size=1,
+        alpha_matting_foreground_threshold=230,   # was 245 — less aggressive, better for light objects on light bg
+        alpha_matting_background_threshold=15,    # was 12 — slightly more generous bg trimap
+        alpha_matting_erode_size=2,               # was 1 — cleaner trimap separation reduces contaminated edges
     )
 
     rgba_pil = ensure_rgba(cutout_png)
@@ -443,22 +443,65 @@ def choose_best_mask(rgb: np.ndarray) -> np.ndarray:
     return rb_mask
 
 
-def build_rgba(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+def sample_background_color(rgb: np.ndarray) -> np.ndarray:
+    """
+    Estimate the background color by sampling corner patches.
+    Returns a (1, 1, 3) float32 array.
+    """
+    h, w = rgb.shape[:2]
+    p = max(4, min(20, int(min(h, w) * 0.02)))
+    corners = np.concatenate([
+        rgb[0:p, 0:p].reshape(-1, 3),
+        rgb[0:p, w - p:w].reshape(-1, 3),
+        rgb[h - p:h, 0:p].reshape(-1, 3),
+        rgb[h - p:h, w - p:w].reshape(-1, 3),
+    ], axis=0).astype(np.float32)
+    return corners.mean(axis=0).reshape(1, 1, 3)
 
+
+def build_rgba(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """
+    Build an RGBA image from an RGB image and a boolean foreground mask.
+
+    Key changes vs original:
+      - erode by 1 iteration (was 2) — less object shrinkage
+      - smaller blur kernel (5x5 vs 7x7) — thinner feather zone
+      - decontaminate semi-transparent edge pixels to remove grey halo
+    """
     mask_u8 = (mask.astype(np.uint8) * 255)
 
-    # --- shrink mask slightly ---
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
-    mask_eroded = cv2.erode(mask_u8, kernel, iterations=2)
+    # Shrink mask slightly to pull alpha away from the hard edge
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask_eroded = cv2.erode(mask_u8, kernel, iterations=1)  # was 2
 
-    # --- feather edge ---
-    alpha = cv2.GaussianBlur(mask_eroded, (7,7), 0)
-
+    # Feather the edge — smaller kernel = tighter feather, less halo zone
+    alpha = cv2.GaussianBlur(mask_eroded, (5, 5), 0)  # was (7, 7)
     alpha = np.clip(alpha, 0, 255).astype(np.uint8)
 
-    rgba = np.dstack([rgb, alpha])
+    # --- Background colour decontamination ---
+    # Semi-transparent edge pixels contain a mix of object + background colour.
+    # Formula: true_fg = (mixed - bg * (1 - a)) / a
+    # This reverses the premultiplication so the RGB under low-alpha pixels
+    # reflects the real object colour rather than grey background bleed.
+    bg_color = sample_background_color(rgb)
 
-    return rgba
+    alpha_f = alpha.astype(np.float32) / 255.0
+    rgb_f = rgb.astype(np.float32)
+
+    # Avoid division by zero; pixels with alpha ~0 don't matter visually
+    safe_alpha = np.maximum(alpha_f, 0.001)[..., np.newaxis]
+
+    decontaminated = (rgb_f - bg_color * (1.0 - alpha_f[..., np.newaxis])) / safe_alpha
+    decontaminated = np.clip(decontaminated, 0, 255)
+
+    # Only apply correction in the feathered transition zone (not fully opaque or transparent)
+    transition = (alpha_f > 0.04) & (alpha_f < 0.96)
+    result_rgb = rgb_f.copy()
+    result_rgb[transition] = decontaminated[transition]
+    result_rgb = np.clip(result_rgb, 0, 255).astype(np.uint8)
+
+    return np.dstack([result_rgb, alpha])
+
 
 def resize_if_huge(img: Image.Image) -> Image.Image:
     w, h = img.size
@@ -480,7 +523,7 @@ def health():
         "ok": True,
         "model": REMBG_MODEL,
         "max_concurrency": MAX_CONCURRENCY,
-        "version": "4.2.0",
+        "version": "4.3.0",
     }
 
 
