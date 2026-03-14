@@ -444,17 +444,35 @@ def choose_best_mask(rgb: np.ndarray) -> np.ndarray:
 
 
 def build_rgba(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+
+    h, w = mask.shape
+
+    # convert to 8bit mask
     mask_u8 = (mask.astype(np.uint8) * 255)
 
-    # Distance transform based alpha edge refinement
-    dist = cv2.distanceTransform(mask_u8, cv2.DIST_L2, 3)
+    # -----------------------------
+    # 1. supersample mask (2x)
+    # -----------------------------
+    mask_up = cv2.resize(mask_u8, (w*2, h*2), interpolation=cv2.INTER_LINEAR)
 
-    # Create a narrow feathered alpha edge without reintroducing grey halo
-    alpha = np.clip(dist / 2.0, 0.0, 1.0)
-    alpha = (alpha * 255.0).astype(np.uint8)
+    # -----------------------------
+    # 2. light smoothing
+    # -----------------------------
+    mask_up = cv2.GaussianBlur(mask_up, (5,5), 0)
 
-    return np.dstack([rgb, alpha]).astype(np.uint8)
+    # -----------------------------
+    # 3. downsample back
+    # -----------------------------
+    alpha = cv2.resize(mask_up, (w, h), interpolation=cv2.INTER_AREA)
 
+    # -----------------------------
+    # 4. clip
+    # -----------------------------
+    alpha = np.clip(alpha, 0, 255).astype(np.uint8)
+
+    rgba = np.dstack([rgb, alpha])
+
+    return rgba
 
 def resize_if_huge(img: Image.Image) -> Image.Image:
     w, h = img.size
