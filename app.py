@@ -34,7 +34,7 @@ SELF_RESTART_SECONDS = int(os.getenv("SELF_RESTART_SECONDS", "600"))
 # App + model session
 # -------------------------------------------------
 
-app = FastAPI(title="image-processor", version="4.1.0")
+app = FastAPI(title="image-processor", version="4.2.0")
 
 REMBG_MODEL = os.getenv("REMBG_MODEL", "isnet-general-use")
 TARGET_W = int(os.getenv("TARGET_W", "1400"))
@@ -172,10 +172,6 @@ def object_aware_fit(
     patch[:, :, 3] = (out_a[:, :, 0] * 255.0).clip(0, 255).astype(np.uint8)
 
     out[y0:y0 + new_h, x0:x0 + new_w, :] = patch
-
-    # Light final alpha smoothing to reduce hard-step edges
-    out[:, :, 3] = cv2.GaussianBlur(out[:, :, 3], (3, 3), 0)
-
     return out
 
 
@@ -448,12 +444,15 @@ def choose_best_mask(rgb: np.ndarray) -> np.ndarray:
 
 
 def build_rgba(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    mask_u8 = mask.astype(np.uint8) * 255
+    mask_u8 = (mask.astype(np.uint8) * 255)
 
-    # Light alpha smoothing to remove jagged edges / halo stepping
-    mask_u8 = cv2.GaussianBlur(mask_u8, (3, 3), 0)
+    # Distance transform based alpha edge refinement
+    dist = cv2.distanceTransform(mask_u8, cv2.DIST_L2, 3)
 
-    alpha = mask_u8.astype(np.uint8)
+    # Create a narrow feathered alpha edge without reintroducing grey halo
+    alpha = np.clip(dist / 2.0, 0.0, 1.0)
+    alpha = (alpha * 255.0).astype(np.uint8)
+
     return np.dstack([rgb, alpha]).astype(np.uint8)
 
 
@@ -477,7 +476,7 @@ def health():
         "ok": True,
         "model": REMBG_MODEL,
         "max_concurrency": MAX_CONCURRENCY,
-        "version": "4.1.0",
+        "version": "4.2.0",
     }
 
 
