@@ -34,7 +34,7 @@ SELF_RESTART_SECONDS = int(os.getenv("SELF_RESTART_SECONDS", "600"))
 # App + model session
 # -------------------------------------------------
 
-app = FastAPI(title="image-processor", version="4.5.0")
+app = FastAPI(title="image-processor", version="4.6.0")
 
 REMBG_MODEL = os.getenv("REMBG_MODEL", "isnet-general-use")
 TARGET_W = int(os.getenv("TARGET_W", "1400"))
@@ -345,10 +345,7 @@ def mask_score(mask: np.ndarray) -> float:
 
 
 def sample_background_color_corners(rgb: np.ndarray) -> np.ndarray:
-    """
-    Fallback: estimate background colour from image corner patches.
-    Returns a (1, 1, 3) float32 array.
-    """
+    """Estimate background colour from image corner patches. Returns (1,1,3) float32."""
     h, w = rgb.shape[:2]
     p = max(4, min(20, int(min(h, w) * 0.02)))
     corners = np.concatenate([
@@ -363,20 +360,36 @@ def sample_background_color_corners(rgb: np.ndarray) -> np.ndarray:
 def sample_background_color(rgb: np.ndarray, alpha: Optional[np.ndarray] = None) -> np.ndarray:
     """
     Estimate background colour.
-
-    Primary method: sample pixels where rembg is certain they are background
-    (alpha == 0).  These pixels are the actual background immediately
-    surrounding the object — far more accurate than corners for estimating
-    the colour that contaminates edge pixels.
-
-    Falls back to corner sampling if too few definite-bg pixels exist.
+    Primary: pixels where rembg alpha == 0 (definite background near object edges).
+    Fallback: corner patch sampling.
     """
     if alpha is not None:
         bg_pixels = rgb[alpha == 0].astype(np.float32)
         if len(bg_pixels) >= 200:
             return bg_pixels.mean(axis=0).reshape(1, 1, 3)
-
     return sample_background_color_corners(rgb)
+
+
+def build_edge_band_mask(alpha: np.ndarray, band_px: int = 12) -> np.ndarray:
+    """
+    Build a boolean mask covering only the narrow transition band at the
+    alpha edge — pixels within band_px of the alpha boundary.
+
+    This is the spatial constraint that prevents halo suppression from
+    touching the interior of objects whose colour happens to be similar
+    to the background (e.g. cream objects on white backgrounds).
+
+    Method:
+      - Erode the solid-fg region inward by band_px  → inner boundary
+      - Dilate the solid-fg region outward by band_px → outer boundary
+      - Band = outer - inner
+    """
+    solid = (alpha > 200).astype(np.uint8)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * band_px + 1, 2 * band_px + 1))
+    inner = cv2.erode(solid, k, iterations=1)
+    outer = cv2.dilate(solid, k, iterations=1)
+    band = (outer - inner).astype(bool)
+    return band
 
 
 def decontaminate_rgba(
@@ -385,53 +398,59 @@ def decontaminate_rgba(
     bg_color: np.ndarray,
 ) -> np.ndarray:
     """
-    Remove background colour contamination from semi-transparent edge pixels,
-    then suppress residual halo pixels whose colour remains close to the
-    background after decontamination.
+    Remove background colour contamination from semi-transparent edge pixels.
 
-    Two-pass approach:
-      Pass 1 — colour unmix (straighten the pre-multiplied blend):
-          true_fg = (blended_rgb - bg * (1 - a)) / a
-      Pass 2 — halo suppression:
-          Pixels still close to bg colour after unmixing have their alpha
-          driven toward 0 proportionally to how bg-like they are.
-          This kills the grey "fog" that persists after plain unmixing.
+    Two-pass approach, both spatially constrained to the edge transition band:
+
+    Pass 1 — colour unmix (reverse the background blend in the feather zone):
+        true_fg = (blended_rgb - bg * (1 - a)) / a
+        Applied only where 4% < alpha < 96% AND within edge band.
+
+    Pass 2 — halo suppression (kill residual fog near bg colour):
+        Pixels still close to bg colour after unmixing get alpha scaled down.
+        Applied only where alpha < 85% AND within edge band.
+
+        CRITICAL: spatial constraint via edge_band prevents this from
+        touching interior object regions with similar colour to bg
+        (the cream-object-on-white-background failure mode from v4.5).
     """
     alpha_f = alpha.astype(np.float32) / 255.0
     rgb_f = rgb.astype(np.float32)
 
+    # Spatial constraint: only work within the narrow edge band
+    edge_band = build_edge_band_mask(alpha, band_px=12)
+
     # ------------------------------------------------------------------
-    # Pass 1: colour unmix in the feathered transition zone
+    # Pass 1: colour unmix in feathered transition zone within edge band
     # ------------------------------------------------------------------
     safe_alpha = np.maximum(alpha_f, 0.001)[..., np.newaxis]
     decontaminated = (rgb_f - bg_color * (1.0 - alpha_f[..., np.newaxis])) / safe_alpha
     decontaminated = np.clip(decontaminated, 0, 255)
 
-    transition = (alpha_f > 0.04) & (alpha_f < 0.96)
+    transition = (alpha_f > 0.04) & (alpha_f < 0.96) & edge_band
     result_rgb = rgb_f.copy()
     result_rgb[transition] = decontaminated[transition]
     result_rgb = np.clip(result_rgb, 0, 255)
 
     # ------------------------------------------------------------------
-    # Pass 2: halo suppression
-    # Pixels whose colour — even after unmixing — is still close to the
-    # background get their alpha scaled down toward zero.
-    # Threshold of 30 in Euclidean RGB catches grey/white halos without
-    # touching genuinely light-coloured parts of the object.
+    # Pass 2: halo suppression — only in edge band, not object interior
+    #
+    # Pixels in the edge band whose colour (post-unmix) is still within
+    # halo_thresh of the background get their alpha driven toward 0.
+    # Because we gate on edge_band, this CANNOT eat into the object body
+    # even when the object is a similar colour to the background.
     # ------------------------------------------------------------------
     dist_to_bg = np.sqrt(np.sum((result_rgb - bg_color) ** 2, axis=2))
 
-    # Scale factor: 0.0 when dist==0 (pure bg), 1.0 when dist>=halo_thresh (safe fg)
     halo_thresh = 30.0
     halo_scale = np.clip(dist_to_bg / halo_thresh, 0.0, 1.0)
 
-    # Only apply suppression in the uncertain zone (alpha < 0.85)
-    # so solid object pixels are never touched
-    suppress_zone = alpha_f < 0.85
+    # Gate: uncertain alpha AND spatially in the edge band only
+    suppress_zone = (alpha_f < 0.85) & edge_band
     alpha_f_out = alpha_f.copy()
     alpha_f_out[suppress_zone] *= halo_scale[suppress_zone]
 
-    # Snap very low residual alpha to 0 to avoid near-invisible fog
+    # Snap near-zero residual to 0 to avoid invisible fog
     alpha_f_out[alpha_f_out < 0.04] = 0.0
 
     result_alpha = np.clip(alpha_f_out * 255.0, 0, 255).astype(np.uint8)
@@ -465,8 +484,8 @@ def rembg_rgba(rgb: np.ndarray) -> np.ndarray:
 
 def build_rgba_from_floodfill(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """
-    Build RGBA from a binary floodfill mask with smooth feather +
-    decontamination.  Used only when floodfill beats rembg on scoring.
+    Build RGBA from binary floodfill mask + decontamination.
+    Used only when floodfill beats rembg on scoring.
     """
     mask_u8 = (mask.astype(np.uint8) * 255)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -523,17 +542,17 @@ def floodfill_mask(rgb: np.ndarray) -> Tuple[np.ndarray, dict]:
 
 def choose_best_rgba(rgb: np.ndarray) -> np.ndarray:
     """
-    Decide between floodfill and rembg, then return a clean RGBA array.
+    Decide between floodfill and rembg, return clean RGBA.
 
     rembg path:
-      1. Run rembg with alpha matting — preserve the neural-net alpha as-is
-      2. Sample bg colour from rembg's definite-background pixels (alpha==0)
-         for maximum accuracy near edges
-      3. Decontaminate edge pixels (colour unmix) then suppress residual halo
-         pixels whose colour is still close to background
+      1. Preserve rembg's neural-net alpha as-is (no binarise/re-feather)
+      2. Sample bg colour from rembg's definite-bg pixels (alpha == 0)
+      3. Decontaminate within the narrow alpha edge band only
+         — spatially constrained so similar-coloured object interiors
+           are never touched (fixes cream/white object failure mode)
 
-    floodfill path (only when it clearly wins on score):
-      Build feathered alpha from binary mask + corner-based decontamination
+    floodfill path (only when score clearly beats rembg):
+      Feathered alpha from binary mask + edge-band decontamination
     """
     h, w = rgb.shape[:2]
     max_dim = max(h, w)
@@ -552,7 +571,7 @@ def choose_best_rgba(rgb: np.ndarray) -> np.ndarray:
             ff_mask = None
             ff_score = -999.0
 
-    # Run rembg — returns RGBA with smooth neural-net alpha
+    # Run rembg — get full RGBA with smooth neural-net alpha
     rb_rgba = rembg_rgba(rgb)
     rb_alpha = rb_rgba[:, :, 3]
 
@@ -566,7 +585,7 @@ def choose_best_rgba(rgb: np.ndarray) -> np.ndarray:
     if ff_mask is not None and ff_score >= rb_score + 0.5:
         return build_rgba_from_floodfill(rgb, ff_mask)
 
-    # rembg wins: sample bg from definite-background pixels in rembg output
+    # rembg wins: sample bg from definite-background pixels, decontaminate
     bg_color = sample_background_color(rgb, alpha=rb_alpha)
     return decontaminate_rgba(rb_rgba[:, :, :3], rb_alpha, bg_color)
 
@@ -591,7 +610,7 @@ def health():
         "ok": True,
         "model": REMBG_MODEL,
         "max_concurrency": MAX_CONCURRENCY,
-        "version": "4.5.0",
+        "version": "4.6.0",
     }
 
 
@@ -689,3 +708,4 @@ async def process_image(
             pass
 
         gc.collect()
+    
