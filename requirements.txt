@@ -1,12 +1,9 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.2.2+cpu
-torchvision==0.17.2+cpu
 fastapi
 uvicorn[standard]
 python-multipart
 transparent-background
-torch
-torchvision
+torch==2.2.2+cpu
+torchvision==0.17.2+cpu
 pillow
 opencv-python-headless
 numpy
