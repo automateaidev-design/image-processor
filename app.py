@@ -12,6 +12,10 @@ from PIL import Image
 
 from rembg import remove, new_session
 
+# -------------------------------------------------
+# Stability / performance
+# -------------------------------------------------
+
 try:
     cv2.setNumThreads(1)
 except Exception:
@@ -26,17 +30,22 @@ QUEUE_TIMEOUT_S = float(os.getenv("QUEUE_TIMEOUT_S", "15"))
 ENABLE_SELF_RESTART = os.getenv("ENABLE_SELF_RESTART", "0") == "1"
 SELF_RESTART_SECONDS = int(os.getenv("SELF_RESTART_SECONDS", "600"))
 
-app = FastAPI(title="image-processor", version="3.0.0")
+# -------------------------------------------------
+# App + model session
+# -------------------------------------------------
+
+app = FastAPI(title="image-processor", version="4.0.0")
 
 REMBG_MODEL = os.getenv("REMBG_MODEL", "isnet-general-use")
-_session = None
-
 TARGET_W = int(os.getenv("TARGET_W", "1400"))
 TARGET_H = int(os.getenv("TARGET_H", "1700"))
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
+MAX_IMAGE_DIM = int(os.getenv("MAX_IMAGE_DIM", "8000"))
+
+_session = None
 SEM = asyncio.Semaphore(max(1, MAX_CONCURRENCY))
 
 
@@ -52,6 +61,10 @@ async def _startup():
 
         asyncio.create_task(_restarter())
 
+
+# -------------------------------------------------
+# Utility helpers
+# -------------------------------------------------
 
 def clamp_int(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, int(v)))
@@ -157,30 +170,55 @@ def object_aware_fit(
 
 
 def dynamic_corner_patch_size(h: int, w: int) -> int:
-    return max(6, min(40, int(round(min(h, w) * 0.03))))
+    return max(6, min(36, int(round(min(h, w) * 0.025))))
 
 
-def sample_corner_pixels(rgb: np.ndarray) -> np.ndarray:
+def corner_patch_stats(rgb: np.ndarray) -> dict:
     h, w = rgb.shape[:2]
     p = dynamic_corner_patch_size(h, w)
 
-    patches = [
-        rgb[0:p, 0:p],
-        rgb[0:p, w - p:w],
-        rgb[h - p:h, 0:p],
-        rgb[h - p:h, w - p:w],
-    ]
-    return np.concatenate([x.reshape(-1, 3) for x in patches], axis=0)
+    tl = rgb[0:p, 0:p]
+    tr = rgb[0:p, w - p:w]
+    bl = rgb[h - p:h, 0:p]
+    br = rgb[h - p:h, w - p:w]
+
+    corners = np.concatenate([x.reshape(-1, 3) for x in (tl, tr, bl, br)], axis=0).astype(np.uint8)
+    corners_lab = cv2.cvtColor(corners.reshape(-1, 1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
+
+    per_corner_means = []
+    for patch in (tl, tr, bl, br):
+        arr = patch.reshape(-1, 1, 3).astype(np.uint8)
+        lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
+        per_corner_means.append(lab.mean(axis=0))
+
+    per_corner_means = np.stack(per_corner_means, axis=0)
+    mean_lab = corners_lab.mean(axis=0)
+    internal_spread = float(np.mean(np.std(corners_lab, axis=0)))
+
+    corner_mean_dists = []
+    for i in range(4):
+        for j in range(i + 1, 4):
+            corner_mean_dists.append(float(np.linalg.norm(per_corner_means[i] - per_corner_means[j])))
+
+    inter_corner_variation = float(max(corner_mean_dists)) if corner_mean_dists else 0.0
+
+    return {
+        "mean_lab": mean_lab,
+        "internal_spread": internal_spread,
+        "inter_corner_variation": inter_corner_variation,
+        "patch_size": p,
+    }
 
 
-def background_stats_from_corners(rgb: np.ndarray) -> Tuple[np.ndarray, float, bool]:
-    corner_pixels = sample_corner_pixels(rgb).astype(np.uint8)
-    corner_lab = cv2.cvtColor(corner_pixels.reshape(-1, 1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3)
+def is_flat_background(stats: dict, max_dim: int) -> bool:
+    internal_spread = stats["internal_spread"]
+    inter_corner_variation = stats["inter_corner_variation"]
 
-    mean_lab = corner_lab.mean(axis=0).astype(np.float32)
-    spread = float(np.mean(np.std(corner_lab.astype(np.float32), axis=0)))
-    uniform = spread <= 10.5
-    return mean_lab, spread, uniform
+    if max_dim < 700:
+        return internal_spread <= 7.0 and inter_corner_variation <= 10.0
+    if max_dim < 1600:
+        return internal_spread <= 6.0 and inter_corner_variation <= 8.0
+    return internal_spread <= 5.0 and inter_corner_variation <= 7.0
 
 
 def mask_connected_to_border(candidate: np.ndarray) -> np.ndarray:
@@ -191,21 +229,16 @@ def mask_connected_to_border(candidate: np.ndarray) -> np.ndarray:
         return np.zeros_like(candidate_u8, dtype=bool)
 
     border_labels = set()
-    if candidate_u8[0, :].any():
-        border_labels.update(np.unique(labels[0, candidate_u8[0, :] > 0]).tolist())
-    if candidate_u8[-1, :].any():
-        border_labels.update(np.unique(labels[-1, candidate_u8[-1, :] > 0]).tolist())
-    if candidate_u8[:, 0].any():
-        border_labels.update(np.unique(labels[candidate_u8[:, 0] > 0, 0]).tolist())
-    if candidate_u8[:, -1].any():
-        border_labels.update(np.unique(labels[candidate_u8[:, -1] > 0, -1]).tolist())
-
+    border_labels.update(np.unique(labels[0, :]).tolist())
+    border_labels.update(np.unique(labels[-1, :]).tolist())
+    border_labels.update(np.unique(labels[:, 0]).tolist())
+    border_labels.update(np.unique(labels[:, -1]).tolist())
     border_labels.discard(0)
+
     if not border_labels:
         return np.zeros_like(candidate_u8, dtype=bool)
 
-    bg = np.isin(labels, list(border_labels))
-    return bg
+    return np.isin(labels, list(border_labels))
 
 
 def cleanup_binary_mask(mask: np.ndarray, max_dim: int) -> np.ndarray:
@@ -219,7 +252,7 @@ def cleanup_binary_mask(mask: np.ndarray, max_dim: int) -> np.ndarray:
         k_close = 2
     else:
         k_open = 1
-        k_close = 3
+        k_close = 2
 
     if k_open > 0:
         ko = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k_open + 1, 2 * k_open + 1))
@@ -232,21 +265,57 @@ def cleanup_binary_mask(mask: np.ndarray, max_dim: int) -> np.ndarray:
     return mask_u8 > 0
 
 
-def keep_largest_component(mask: np.ndarray) -> np.ndarray:
+def largest_component(mask: np.ndarray) -> np.ndarray:
+    mask_u8 = mask.astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+    if num_labels <= 1:
+        return mask
+    largest_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    return labels == largest_label
+
+
+def remove_tiny_islands(mask: np.ndarray, max_dim: int) -> np.ndarray:
     mask_u8 = mask.astype(np.uint8)
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
     if num_labels <= 1:
         return mask
 
-    largest_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    return labels == largest_label
+    min_area = 12 if max_dim < 700 else 40 if max_dim < 1600 else 100
+    out = np.zeros_like(mask_u8)
+
+    for label in range(1, num_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area >= min_area:
+            out[labels == label] = 1
+
+    return out > 0
+
+
+def touches_border(mask: np.ndarray) -> float:
+    if mask.size == 0:
+        return 0.0
+    border = np.concatenate([mask[0, :], mask[-1, :], mask[:, 0], mask[:, -1]])
+    return float(np.mean(border.astype(np.float32)))
+
+
+def largest_component_ratio(mask: np.ndarray) -> float:
+    total = int(mask.astype(np.uint8).sum())
+    if total == 0:
+        return 0.0
+
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    if num_labels <= 1:
+        return 0.0
+
+    largest = int(stats[1:, cv2.CC_STAT_AREA].max())
+    return float(largest) / float(total)
 
 
 def rembg_mask(rgb: np.ndarray) -> np.ndarray:
     pil_img = Image.fromarray(rgb, mode="RGB")
-    tmp = io.BytesIO()
-    pil_img.save(tmp, format="PNG")
-    png_in = tmp.getvalue()
+    buf = io.BytesIO()
+    pil_img.save(buf, format="PNG")
+    png_in = buf.getvalue()
 
     cutout_png = remove(
         png_in,
@@ -259,127 +328,136 @@ def rembg_mask(rgb: np.ndarray) -> np.ndarray:
 
     rgba_pil = ensure_rgba(cutout_png)
     rgba = np.array(rgba_pil)
-    return rgba[:, :, 3] > 8
+    mask = rgba[:, :, 3] > 8
+    return mask
 
 
 def floodfill_mask(rgb: np.ndarray) -> Tuple[np.ndarray, dict]:
     h, w = rgb.shape[:2]
     max_dim = max(h, w)
 
-    mean_lab, spread, uniform = background_stats_from_corners(rgb)
-
+    stats = corner_patch_stats(rgb)
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-    dist = np.sqrt(np.sum((lab - mean_lab.reshape(1, 1, 3)) ** 2, axis=2))
+
+    mean_lab = stats["mean_lab"]
+    internal_spread = stats["internal_spread"]
+    inter_corner_variation = stats["inter_corner_variation"]
 
     if max_dim < 700:
-        base_tol = 16.0
+        base_tol = 12.0
     elif max_dim < 1600:
-        base_tol = 18.0
+        base_tol = 11.0
     else:
-        base_tol = 20.0
+        base_tol = 10.0
 
-    tol = clamp_float(base_tol + (spread * 1.5), 12.0, 34.0)
+    tol = base_tol + (internal_spread * 1.0) + (inter_corner_variation * 0.35)
+    tol = clamp_float(tol, 8.0, 18.0)
 
+    dist = np.sqrt(np.sum((lab - mean_lab.reshape(1, 1, 3)) ** 2, axis=2))
     candidate_bg = dist <= tol
+
     bg_mask = mask_connected_to_border(candidate_bg)
     fg_mask = ~bg_mask
 
     fg_mask = cleanup_binary_mask(fg_mask, max_dim)
-    fg_mask = keep_largest_component(fg_mask)
+    fg_mask = remove_tiny_islands(fg_mask, max_dim)
+    fg_mask = largest_component(fg_mask)
+
+    if max_dim >= 700:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        fg_mask = cv2.dilate(fg_mask.astype(np.uint8), kernel, iterations=1) > 0
 
     meta = {
-        "corner_spread": spread,
-        "uniform_bg": uniform,
         "tolerance": tol,
+        "internal_spread": internal_spread,
+        "inter_corner_variation": inter_corner_variation,
     }
     return fg_mask, meta
 
 
-def touches_border(mask: np.ndarray) -> float:
-    if mask.size == 0:
-        return 0.0
-    border = np.concatenate([mask[0, :], mask[-1, :], mask[:, 0], mask[:, -1]])
-    return float(np.mean(border.astype(np.float32)))
-
-
-def largest_component_ratio(mask: np.ndarray) -> float:
-    mask_u8 = mask.astype(np.uint8)
-    total = int(mask_u8.sum())
-    if total == 0:
-        return 0.0
-
-    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
-    if num_labels <= 1:
-        return 0.0
-
-    largest = int(stats[1:, cv2.CC_STAT_AREA].max())
-    return float(largest) / float(total)
-
-
-def mask_score(mask: np.ndarray, prefer_uniform_bg: bool = False, uniform_bg: bool = False) -> float:
+def mask_score(mask: np.ndarray) -> float:
     area_ratio = float(mask.mean())
     border_touch = touches_border(mask)
     component_ratio = largest_component_ratio(mask)
 
     score = 0.0
 
-    if 0.03 <= area_ratio <= 0.90:
+    if 0.02 <= area_ratio <= 0.92:
         score += 2.5
-    elif 0.01 <= area_ratio <= 0.97:
+    elif 0.005 <= area_ratio <= 0.98:
         score += 1.0
     else:
         score -= 3.0
 
-    if border_touch <= 0.02:
+    if border_touch <= 0.01:
         score += 2.0
-    elif border_touch <= 0.08:
+    elif border_touch <= 0.04:
         score += 1.0
+    elif border_touch <= 0.12:
+        score += 0.0
     else:
         score -= 2.0
 
-    if component_ratio >= 0.90:
+    if component_ratio >= 0.93:
         score += 2.0
-    elif component_ratio >= 0.75:
+    elif component_ratio >= 0.80:
         score += 1.0
     else:
         score -= 1.0
 
-    if prefer_uniform_bg and uniform_bg:
-        score += 1.0
-
     return score
 
 
-def build_rgba(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    alpha = (mask.astype(np.uint8) * 255)
-    rgba = np.dstack([rgb, alpha]).astype(np.uint8)
-    return rgba
-
-
 def choose_best_mask(rgb: np.ndarray) -> np.ndarray:
-    ff_mask, ff_meta = floodfill_mask(rgb)
-    ff_score = mask_score(ff_mask, prefer_uniform_bg=True, uniform_bg=ff_meta["uniform_bg"])
+    h, w = rgb.shape[:2]
+    max_dim = max(h, w)
 
-    try:
-        rb_mask = rembg_mask(rgb)
-        rb_mask = cleanup_binary_mask(rb_mask, max(rgb.shape[:2]))
-        rb_mask = keep_largest_component(rb_mask)
-        rb_score = mask_score(rb_mask)
-    except Exception:
-        rb_mask = np.zeros(rgb.shape[:2], dtype=bool)
-        rb_score = -999.0
+    stats = corner_patch_stats(rgb)
+    flat_bg = is_flat_background(stats, max_dim)
 
-    if ff_meta["uniform_bg"] and ff_score >= 3.0:
-        return ff_mask
+    use_floodfill = flat_bg and touches_border(np.zeros((h, w), dtype=bool)) == 0.0
 
-    if rb_score > ff_score + 0.5:
-        return rb_mask
+    ff_mask = None
+    ff_score = -999.0
 
-    if ff_score >= rb_score:
+    if use_floodfill:
+        try:
+            ff_mask, _ = floodfill_mask(rgb)
+            ff_score = mask_score(ff_mask)
+        except Exception:
+            ff_mask = None
+            ff_score = -999.0
+
+    rb_mask = rembg_mask(rgb)
+    rb_mask = cleanup_binary_mask(rb_mask, max_dim)
+    rb_mask = remove_tiny_islands(rb_mask, max_dim)
+    rb_mask = largest_component(rb_mask)
+    rb_score = mask_score(rb_mask)
+
+    if ff_mask is not None and ff_score >= rb_score + 0.5:
         return ff_mask
 
     return rb_mask
 
+
+def build_rgba(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    alpha = (mask.astype(np.uint8) * 255)
+    return np.dstack([rgb, alpha]).astype(np.uint8)
+
+
+def resize_if_huge(img: Image.Image) -> Image.Image:
+    w, h = img.size
+    if max(w, h) <= MAX_IMAGE_DIM:
+        return img
+    scale = MAX_IMAGE_DIM / float(max(w, h))
+    nw = int(round(w * scale))
+    nh = int(round(h * scale))
+    return img.resize((nw, nh), Image.LANCZOS)
+
+
+# -------------------------------------------------
+# Routes
+# -------------------------------------------------
 
 @app.get("/health")
 def health():
@@ -387,7 +465,7 @@ def health():
         "ok": True,
         "model": REMBG_MODEL,
         "max_concurrency": MAX_CONCURRENCY,
-        "version": "3.0.0",
+        "version": "4.0.0",
     }
 
 
@@ -431,16 +509,11 @@ async def process_image(
             return JSONResponse({"error": f"File too large. Max {MAX_UPLOAD_MB}MB"}, status_code=413)
 
         pil_img = pil_open_rgb(raw)
-
-        w, h = pil_img.size
-        max_dim_cap = int(os.getenv("MAX_IMAGE_DIM", "8000"))
-        if max(w, h) > max_dim_cap:
-            scale = max_dim_cap / float(max(w, h))
-            pil_img = pil_img.resize((int(round(w * scale)), int(round(h * scale))), Image.LANCZOS)
+        pil_img = resize_if_huge(pil_img)
 
         rgb = np.array(pil_img)
-
         mask = choose_best_mask(rgb)
+
         if mask is None or not mask.any():
             return JSONResponse({"error": "Failed to extract foreground"}, status_code=422)
 
