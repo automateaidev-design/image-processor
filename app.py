@@ -445,18 +445,39 @@ def choose_best_mask(rgb: np.ndarray) -> np.ndarray:
 
 def build_rgba(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
 
+    h, w = mask.shape
     mask_u8 = (mask.astype(np.uint8) * 255)
 
-    # --- slight erosion (remove halo pixels) ---
+    # ---- slight erosion (remove contaminated outer ring) ----
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3))
     mask_eroded = cv2.erode(mask_u8,kernel,iterations=1)
 
-    # --- feather edge ---
+    # ---- feather edge ----
     alpha = cv2.GaussianBlur(mask_eroded,(5,5),0)
-
     alpha = np.clip(alpha,0,255).astype(np.uint8)
 
-    rgba = np.dstack([rgb,alpha])
+    # ---- edge colour bleed ----
+    rgb_f = rgb.astype(np.float32)
+
+    # find fully solid object pixels
+    solid = alpha > 200
+
+    # distance transform to nearest solid pixel
+    dist, labels = cv2.distanceTransformWithLabels(
+        (~solid).astype(np.uint8),
+        cv2.DIST_L2,
+        5,
+        labelType=cv2.DIST_LABEL_PIXEL
+    )
+
+    labels = labels.reshape(h,w)-1
+    flat_rgb = rgb_f.reshape(-1,3)
+
+    # replace edge colours
+    edge = (alpha>0) & (alpha<200)
+    rgb_f[edge] = flat_rgb[labels[edge]]
+
+    rgba = np.dstack([rgb_f.astype(np.uint8),alpha])
 
     return rgba
 
