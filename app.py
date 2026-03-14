@@ -34,7 +34,7 @@ SELF_RESTART_SECONDS = int(os.getenv("SELF_RESTART_SECONDS", "600"))
 # App + model session
 # -------------------------------------------------
 
-app = FastAPI(title="image-processor", version="4.7.0")
+app = FastAPI(title="image-processor", version="4.8.0")
 
 REMBG_MODEL = os.getenv("REMBG_MODEL", "isnet-general-use")
 TARGET_W = int(os.getenv("TARGET_W", "1400"))
@@ -360,7 +360,7 @@ def sample_background_color_corners(rgb: np.ndarray) -> np.ndarray:
 def sample_background_color(rgb: np.ndarray, alpha: Optional[np.ndarray] = None) -> np.ndarray:
     """
     Estimate background colour.
-    Primary: pixels where rembg alpha == 0 (definite background, most accurate).
+    Primary: pixels where rembg alpha == 0 (most accurate for edge contamination).
     Fallback: corner patch sampling.
     """
     if alpha is not None:
@@ -372,34 +372,50 @@ def sample_background_color(rgb: np.ndarray, alpha: Optional[np.ndarray] = None)
 
 def apply_floodfill_clip(rb_alpha: np.ndarray, ff_mask: np.ndarray) -> np.ndarray:
     """
-    Use the floodfill boundary as a soft spatial clip over rembg's alpha.
+    Use the floodfill boundary as a tight spatial clip over rembg's alpha.
 
     This is the primary halo-removal mechanism for flat-background images.
-    It works regardless of object colour, including the hard case of grey
-    objects on grey/white backgrounds where colour-based halo suppression
-    cannot distinguish halo pixels from real object edge pixels.
+    It is colour-independent — it works for grey objects on grey/white
+    backgrounds where colour-based halo suppression cannot tell halo pixels
+    apart from real object edge pixels.
 
-    The floodfill mask accurately identifies the hard outer boundary of
-    the object (background-connected region vs foreground).  Multiplying
-    rembg's soft alpha by a blurred version of this mask zeros out halo
-    pixels that lie outside the floodfill boundary while preserving
-    rembg's fine-grained smooth alpha for the interior and true edge zone.
+    Construction:
+      1. Erode ff_mask by 1 px — pull clip boundary very slightly inside
+         the true object edge to avoid eating any real pixels.
+      2. Dilate by 3 px — create a narrow outward transition zone (4 px total
+         from eroded edge = tight but soft enough to avoid a visible hard ring).
+      3. Blur with sigma=1.5 — smooth the 4 px ramp.
+      4. Multiply rembg alpha by this [0..1] ramp.
 
-    Gaussian sigma = 3.0 (~6 px transition) gives a gentle enough blend
-    that the clip doesn't introduce a hard visible ring.
+    Result: pixels outside the floodfill boundary are zeroed (halo gone),
+    pixels inside are preserved exactly, with a ~4 px smooth transition
+    at the boundary so there is no visible hard clip ring.
+
+    Previous version used sigma=3 on the raw mask (no erode/dilate) — the
+    soft blur spread halo-side weight too far inward, letting grey halo bleed
+    through. The erode-then-dilate approach constrains the ramp to a narrow
+    zone right at the boundary.
     """
-    ff_u8 = (ff_mask.astype(np.uint8) * 255)
-    ff_soft = cv2.GaussianBlur(ff_u8.astype(np.float32), (0, 0), sigmaX=3.0)
-    ff_soft = np.clip(ff_soft / 255.0, 0.0, 1.0)
-    clipped = (rb_alpha.astype(np.float32) * ff_soft).clip(0, 255).astype(np.uint8)
+    ff_u8 = ff_mask.astype(np.uint8)
+
+    # Pull the base boundary 1 px inside to avoid touching real edge pixels
+    k1 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    eroded = cv2.erode(ff_u8, k1, iterations=1)
+
+    # Grow outward 3 px to create a narrow transition zone
+    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    dilated = cv2.dilate(eroded, k3, iterations=1)
+
+    # Smooth the transition ramp — tight sigma keeps it to ~4 px
+    soft = cv2.GaussianBlur(dilated.astype(np.float32), (0, 0), sigmaX=1.5)
+    soft = np.clip(soft, 0.0, 1.0)
+
+    clipped = (rb_alpha.astype(np.float32) * soft).clip(0, 255).astype(np.uint8)
     return clipped
 
 
 def build_edge_band_mask(alpha: np.ndarray, band_px: int = 12) -> np.ndarray:
-    """
-    Boolean mask covering only the narrow transition band at the alpha edge.
-    Used to spatially constrain halo suppression to the fringe zone only.
-    """
+    """Boolean mask covering only the narrow transition band at the alpha edge."""
     solid = (alpha > 200).astype(np.uint8)
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * band_px + 1, 2 * band_px + 1))
     inner = cv2.erode(solid, k, iterations=1)
@@ -416,27 +432,21 @@ def decontaminate_rgba(
     """
     Remove background colour contamination from semi-transparent edge pixels.
 
-    Pass 1 — colour unmix (always applied):
-        Reverses the background colour bleed in the feathered transition zone.
+    Pass 1 — colour unmix (always):
         true_fg = (blended_rgb - bg * (1 - a)) / a
-        Applied where 4% < alpha < 96% AND within the alpha edge band.
+        Applied in the feathered transition zone within the edge band.
 
-    Pass 2 — halo suppression (applied only when suppress_halo=True):
-        For non-flat-background images where no spatial floodfill clip is
-        available, further suppress pixels whose colour remains close to bg.
-        Spatially constrained to the edge band to avoid eating similar-
-        coloured object interiors.
-        suppress_halo=False when the floodfill clip has already handled
-        halo removal spatially (flat-bg path).
+    Pass 2 — colour-distance halo suppression (suppress_halo=True only):
+        Used on non-flat-background images where no floodfill spatial clip
+        is available. Spatially constrained to the edge band.
+        NOT used on flat-bg path — floodfill clip handles halo there.
     """
     alpha_f = alpha.astype(np.float32) / 255.0
     rgb_f = rgb.astype(np.float32)
 
     edge_band = build_edge_band_mask(alpha, band_px=12)
 
-    # ------------------------------------------------------------------
-    # Pass 1: colour unmix in feathered transition zone within edge band
-    # ------------------------------------------------------------------
+    # Pass 1: colour unmix
     safe_alpha = np.maximum(alpha_f, 0.001)[..., np.newaxis]
     decontaminated = (rgb_f - bg_color * (1.0 - alpha_f[..., np.newaxis])) / safe_alpha
     decontaminated = np.clip(decontaminated, 0, 255)
@@ -446,9 +456,7 @@ def decontaminate_rgba(
     result_rgb[transition] = decontaminated[transition]
     result_rgb = np.clip(result_rgb, 0, 255)
 
-    # ------------------------------------------------------------------
-    # Pass 2: colour-distance halo suppression (non-flat-bg path only)
-    # ------------------------------------------------------------------
+    # Pass 2: colour-distance suppression (non-flat-bg only)
     if suppress_halo:
         dist_to_bg = np.sqrt(np.sum((result_rgb - bg_color) ** 2, axis=2))
         halo_thresh = 30.0
@@ -461,14 +469,11 @@ def decontaminate_rgba(
     else:
         result_alpha = alpha
 
-    result_rgb_u8 = result_rgb.clip(0, 255).astype(np.uint8)
-    return np.dstack([result_rgb_u8, result_alpha])
+    return np.dstack([result_rgb.clip(0, 255).astype(np.uint8), result_alpha])
 
 
 def rembg_rgba(rgb: np.ndarray) -> np.ndarray:
-    """
-    Run rembg and return full RGBA, preserving the neural-net's smooth alpha.
-    """
+    """Run rembg and return full RGBA, preserving the neural-net's smooth alpha."""
     pil_img = Image.fromarray(rgb, mode="RGB")
     buf = io.BytesIO()
     pil_img.save(buf, format="PNG")
@@ -484,14 +489,11 @@ def rembg_rgba(rgb: np.ndarray) -> np.ndarray:
     )
 
     rgba_pil = ensure_rgba(cutout_png)
-    return np.array(rgba_pil)   # H x W x 4, uint8
+    return np.array(rgba_pil)
 
 
 def build_rgba_from_floodfill(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """
-    Build RGBA from binary floodfill mask + decontamination.
-    Used only when floodfill clearly beats rembg on scoring.
-    """
+    """Feathered RGBA from binary floodfill mask. Fallback when rembg fails."""
     mask_u8 = (mask.astype(np.uint8) * 255)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mask_eroded = cv2.erode(mask_u8, kernel, iterations=1)
@@ -546,28 +548,24 @@ def floodfill_mask(rgb: np.ndarray) -> Tuple[np.ndarray, dict]:
 
 def choose_best_rgba(rgb: np.ndarray) -> np.ndarray:
     """
-    Produce the cleanest possible RGBA cutout.
+    Produce the cleanest RGBA cutout.
 
-    Strategy for flat-background images (white/grey studio shots — the
-    majority of industrial part photos):
+    Flat-background path (studio shots, uniform white/grey bg):
+      1. rembg → smooth neural-net alpha (preserves fine serrations, pins etc.)
+      2. floodfill → accurate hard outer boundary
+      3. apply_floodfill_clip() → tight spatial multiply:
+           - erode ff mask 1px (don't bite real pixels)
+           - dilate 3px (narrow transition zone)
+           - blur sigma=1.5 (~4px ramp)
+           - multiply rembg alpha by ramp
+         → halo outside boundary zeroed, rembg feathering inside preserved
+      4. Colour unmix pass only (no colour-distance suppression)
 
-      1. Run rembg → get smooth neural-net alpha (best for fine detail)
-      2. Run floodfill → get accurate hard outer boundary (best for halo)
-      3. Multiply rembg alpha by soft floodfill boundary clip
-         → zeros out outer halo pixels (spatial, colour-independent)
-         → preserves rembg's smooth feathering inside the object
-      4. Apply colour unmix (Pass 1 decontamination) — no colour-based
-         halo suppression needed since step 3 already handled halo spatially
+    Non-flat-background path:
+      rembg alpha + colour-distance halo suppression (edge band constrained)
 
-    This combined approach solves the grey-object-on-grey-background
-    problem where colour-based suppression cannot distinguish halo from
-    real edge: floodfill is colour-agnostic and always correctly identifies
-    the hard bg/fg boundary for uniform backgrounds.
-
-    Edge cases:
-      - floodfill fails (score too low): fall back to rembg + suppress_halo
-      - rembg completely fails (ff much better): use floodfill alpha only
-      - non-flat background: rembg only with colour-based suppression
+    Floodfill-only fallback (rembg clearly failed on score):
+      Hard feathered mask from floodfill
     """
     h, w = rgb.shape[:2]
     max_dim = max(h, w)
@@ -575,14 +573,12 @@ def choose_best_rgba(rgb: np.ndarray) -> np.ndarray:
     stats = corner_patch_stats(rgb)
     flat_bg = is_flat_background(stats, max_dim)
 
-    # Always run rembg — we need its smooth alpha regardless of path
     rb_rgba = rembg_rgba(rgb)
     rb_alpha = rb_rgba[:, :, 3]
     rb_rgb = rb_rgba[:, :, :3]
 
     bg_color = sample_background_color(rgb, alpha=rb_alpha)
 
-    # Binary rembg mask for scoring
     rb_mask_bin = rb_alpha > 8
     rb_mask_bin = cleanup_binary_mask(rb_mask_bin, max_dim)
     rb_mask_bin = remove_tiny_islands(rb_mask_bin, max_dim)
@@ -599,17 +595,14 @@ def choose_best_rgba(rgb: np.ndarray) -> np.ndarray:
 
         if ff_mask is not None:
             if ff_score >= rb_score + 2.0:
-                # rembg really failed — use floodfill alpha only
+                # rembg clearly failed — use floodfill alpha only
                 return build_rgba_from_floodfill(rgb, ff_mask)
 
-            # Normal flat-bg path: clip rembg alpha with floodfill boundary.
-            # This removes halo regardless of object/bg colour contrast.
-            # suppress_halo=False because spatial clip has handled it.
+            # Main flat-bg path: tight spatial clip + colour unmix
             clipped_alpha = apply_floodfill_clip(rb_alpha, ff_mask)
             return decontaminate_rgba(rb_rgb, clipped_alpha, bg_color, suppress_halo=False)
 
-    # Non-flat background or floodfill failed:
-    # rembg alpha only, with colour-based halo suppression
+    # Non-flat or floodfill failed: rembg + colour-based suppression
     return decontaminate_rgba(rb_rgb, rb_alpha, bg_color, suppress_halo=True)
 
 
@@ -633,7 +626,7 @@ def health():
         "ok": True,
         "model": REMBG_MODEL,
         "max_concurrency": MAX_CONCURRENCY,
-        "version": "4.7.0",
+        "version": "4.8.0",
     }
 
 
