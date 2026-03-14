@@ -444,38 +444,20 @@ def choose_best_mask(rgb: np.ndarray) -> np.ndarray:
 
 
 def build_rgba(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+
     mask_u8 = (mask.astype(np.uint8) * 255)
 
-    # 1) Anti-aliased alpha from supersampled mask
-    h, w = mask_u8.shape
-    mask_up = cv2.resize(mask_u8, (w * 2, h * 2), interpolation=cv2.INTER_LINEAR)
-    mask_up = cv2.GaussianBlur(mask_up, (5, 5), 0)
-    alpha = cv2.resize(mask_up, (w, h), interpolation=cv2.INTER_AREA)
-    alpha = np.clip(alpha, 0, 255).astype(np.uint8)
+    # --- slight erosion (remove halo pixels) ---
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3))
+    mask_eroded = cv2.erode(mask_u8,kernel,iterations=1)
 
-    # 2) Estimate background colour from corners
-    p = max(4, min(20, int(round(min(h, w) * 0.02))))
-    corners = np.concatenate([
-        rgb[0:p, 0:p].reshape(-1, 3),
-        rgb[0:p, w-p:w].reshape(-1, 3),
-        rgb[h-p:h, 0:p].reshape(-1, 3),
-        rgb[h-p:h, w-p:w].reshape(-1, 3),
-    ], axis=0).astype(np.float32)
-    bg = np.median(corners, axis=0)
+    # --- feather edge ---
+    alpha = cv2.GaussianBlur(mask_eroded,(5,5),0)
 
-    # 3) Remove baked-in grey/white fringe from semi-transparent edge pixels
-    rgb_f = rgb.astype(np.float32)
-    a = alpha.astype(np.float32) / 255.0
-    a3 = np.repeat(a[:, :, None], 3, axis=2)
+    alpha = np.clip(alpha,0,255).astype(np.uint8)
 
-    safe_a3 = np.maximum(a3, 1e-5)
-    decontaminated = (rgb_f - bg.reshape(1, 1, 3) * (1.0 - a3)) / safe_a3
-    decontaminated = np.clip(decontaminated, 0, 255)
+    rgba = np.dstack([rgb,alpha])
 
-    # Keep fully transparent pixels clean
-    out_rgb = np.where(a3 > 0.0, decontaminated, 0)
-
-    rgba = np.dstack([out_rgb.astype(np.uint8), alpha]).astype(np.uint8)
     return rgba
 
 def resize_if_huge(img: Image.Image) -> Image.Image:
