@@ -4,5 +4,5 @@ python-multipart
 transparent-background
 pillow
 opencv-python-headless
-"numpy<2"
+numpy<2
 gunicorn
