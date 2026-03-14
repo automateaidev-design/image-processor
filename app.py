@@ -34,7 +34,7 @@ SELF_RESTART_SECONDS = int(os.getenv("SELF_RESTART_SECONDS", "600"))
 # App + model session
 # -------------------------------------------------
 
-app = FastAPI(title="image-processor", version="4.0.0")
+app = FastAPI(title="image-processor", version="4.1.0")
 
 REMBG_MODEL = os.getenv("REMBG_MODEL", "isnet-general-use")
 TARGET_W = int(os.getenv("TARGET_W", "1400"))
@@ -101,7 +101,13 @@ def build_filename(prefix: str, mpn: str, sku: str, ext: str) -> str:
 def save_lossless_webp(rgba_arr: np.ndarray) -> bytes:
     img = Image.fromarray(rgba_arr, mode="RGBA")
     buf = io.BytesIO()
-    img.save(buf, format="WEBP", lossless=True, quality=100, method=6)
+    img.save(
+        buf,
+        format="WEBP",
+        lossless=True,
+        method=6,
+        exact=True,
+    )
     return buf.getvalue()
 
 
@@ -166,6 +172,10 @@ def object_aware_fit(
     patch[:, :, 3] = (out_a[:, :, 0] * 255.0).clip(0, 255).astype(np.uint8)
 
     out[y0:y0 + new_h, x0:x0 + new_w, :] = patch
+
+    # Light final alpha smoothing to reduce hard-step edges
+    out[:, :, 3] = cv2.GaussianBlur(out[:, :, 3], (3, 3), 0)
+
     return out
 
 
@@ -328,8 +338,7 @@ def rembg_mask(rgb: np.ndarray) -> np.ndarray:
 
     rgba_pil = ensure_rgba(cutout_png)
     rgba = np.array(rgba_pil)
-    mask = rgba[:, :, 3] > 8
-    return mask
+    return rgba[:, :, 3] > 8
 
 
 def floodfill_mask(rgb: np.ndarray) -> Tuple[np.ndarray, dict]:
@@ -415,12 +424,10 @@ def choose_best_mask(rgb: np.ndarray) -> np.ndarray:
     stats = corner_patch_stats(rgb)
     flat_bg = is_flat_background(stats, max_dim)
 
-    use_floodfill = flat_bg and touches_border(np.zeros((h, w), dtype=bool)) == 0.0
-
     ff_mask = None
     ff_score = -999.0
 
-    if use_floodfill:
+    if flat_bg:
         try:
             ff_mask, _ = floodfill_mask(rgb)
             ff_score = mask_score(ff_mask)
@@ -441,7 +448,12 @@ def choose_best_mask(rgb: np.ndarray) -> np.ndarray:
 
 
 def build_rgba(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    alpha = (mask.astype(np.uint8) * 255)
+    mask_u8 = mask.astype(np.uint8) * 255
+
+    # Light alpha smoothing to remove jagged edges / halo stepping
+    mask_u8 = cv2.GaussianBlur(mask_u8, (3, 3), 0)
+
+    alpha = mask_u8.astype(np.uint8)
     return np.dstack([rgb, alpha]).astype(np.uint8)
 
 
@@ -465,7 +477,7 @@ def health():
         "ok": True,
         "model": REMBG_MODEL,
         "max_concurrency": MAX_CONCURRENCY,
-        "version": "4.0.0",
+        "version": "4.1.0",
     }
 
 
