@@ -20,8 +20,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 RUN mkdir -p /app/models
 
-# Pre-download RMBG-1.4 — same model as rembg.com
-RUN python -c "from rembg import new_session; new_session('rmbg')"
+# Pre-download BRIA RMBG-1.4 — same model as rembg.com
+RUN python -c "from rembg import new_session; new_session('bria-rmbg')"
 
 COPY app.py .
 
