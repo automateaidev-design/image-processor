@@ -5,7 +5,7 @@ import asyncio
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import Response, JSONResponse
 from PIL import Image
-from transparent_background import Remover
+from rembg import remove, new_session
 
 print(f"Starting app with PORT={os.getenv('PORT')}", flush=True)
 
@@ -16,11 +16,11 @@ QUEUE_TIMEOUT_S  = float(os.getenv("QUEUE_TIMEOUT_S", "60"))
 MAX_UPLOAD_MB    = int(os.getenv("MAX_UPLOAD_MB", "10"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 MAX_IMAGE_DIM    = int(os.getenv("MAX_IMAGE_DIM", "3000"))
-MODE             = os.getenv("INSPYRENET_MODE", "base")
+RMBG_MODEL       = os.getenv("RMBG_MODEL", "bria-rmbg")
 
-app = FastAPI(title="image-processor", version="9.0.0")
+app = FastAPI(title="image-processor", version="10.0.0")
 SEM = asyncio.Semaphore(max(1, MAX_CONCURRENCY))
-REMOVER = None
+SESSION = None
 
 
 # ── Middleware ────────────────────────────────────────────────────────────────
@@ -41,18 +41,18 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "port": os.getenv("PORT"), "mode": MODE}
+    return {"ok": True, "port": os.getenv("PORT"), "model": RMBG_MODEL}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def get_remover():
-    global REMOVER
-    if REMOVER is None:
-        print(f"loading InSPyReNet model: mode={MODE}", flush=True)
-        REMOVER = Remover(mode=MODE)
-        print("InSPyReNet model loaded", flush=True)
-    return REMOVER
+def get_session():
+    global SESSION
+    if SESSION is None:
+        print(f"loading model: {RMBG_MODEL}", flush=True)
+        SESSION = new_session(RMBG_MODEL)
+        print("model loaded", flush=True)
+    return SESSION
 
 def resize_if_huge(img: Image.Image) -> Image.Image:
     w, h = img.size
@@ -82,19 +82,17 @@ async def process_image(file: UploadFile = File(...)):
         if len(raw) > MAX_UPLOAD_BYTES:
             return JSONResponse({"error": f"File too large. Max {MAX_UPLOAD_MB}MB"}, status_code=413)
 
-        # Open and normalise
+        # Open, normalise to RGB, cap dimensions
         img = Image.open(io.BytesIO(raw)).convert("RGB")
         img = resize_if_huge(img)
 
-        # Run InSPyReNet — returns RGBA PIL image
-        print("running InSPyReNet", flush=True)
-        result = get_remover().process(img, type="rgba")
-        print("InSPyReNet complete", flush=True)
-
-        # Encode to PNG bytes
+        # Convert to PNG bytes for rembg
         buf = io.BytesIO()
-        result.save(buf, format="PNG")
-        out = buf.getvalue()
+        img.save(buf, format="PNG")
+        png_in = buf.getvalue()
+
+        print("running rembg", flush=True)
+        out = remove(png_in, session=get_session())
         print(f"output bytes: {len(out)}", flush=True)
 
         return Response(content=out, media_type="image/png")
