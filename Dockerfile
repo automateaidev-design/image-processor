@@ -3,6 +3,7 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PORT=8000
+ENV U2NET_HOME=/app/models
 
 WORKDIR /app
 
@@ -17,11 +18,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Pre-download model during build so Railway doesn't re-download on cold start
-RUN python -c "from rembg import new_session; new_session('birefnet-general')"
+# Pre-download InSPyReNet base model during build
+RUN python -c "from transparent_background import Remover; Remover(mode='base')"
 
 COPY app.py .
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT}"]
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
