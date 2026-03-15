@@ -5,28 +5,22 @@ import asyncio
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import Response, JSONResponse
 from PIL import Image
-from rembg import remove, new_session
+from transparent_background import Remover
 
 print(f"Starting app with PORT={os.getenv('PORT')}", flush=True)
 
-try:
-    import cv2
-    cv2.setNumThreads(1)
-except Exception:
-    pass
-
 Image.MAX_IMAGE_PIXELS = int(os.getenv("PIL_MAX_IMAGE_PIXELS", "60000000"))
 
-MAX_CONCURRENCY    = int(os.getenv("MAX_CONCURRENCY", "1"))
-QUEUE_TIMEOUT_S    = float(os.getenv("QUEUE_TIMEOUT_S", "30"))
-MAX_UPLOAD_MB      = int(os.getenv("MAX_UPLOAD_MB", "10"))
-MAX_UPLOAD_BYTES   = MAX_UPLOAD_MB * 1024 * 1024
-MAX_IMAGE_DIM      = int(os.getenv("MAX_IMAGE_DIM", "3000"))
-RMBG_MODEL         = os.getenv("RMBG_MODEL", "birefnet-general")
+MAX_CONCURRENCY  = int(os.getenv("MAX_CONCURRENCY", "1"))
+QUEUE_TIMEOUT_S  = float(os.getenv("QUEUE_TIMEOUT_S", "60"))
+MAX_UPLOAD_MB    = int(os.getenv("MAX_UPLOAD_MB", "10"))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+MAX_IMAGE_DIM    = int(os.getenv("MAX_IMAGE_DIM", "3000"))
+MODE             = os.getenv("INSPYRENET_MODE", "base")
 
-app = FastAPI(title="image-processor", version="8.0.0")
+app = FastAPI(title="image-processor", version="9.0.0")
 SEM = asyncio.Semaphore(max(1, MAX_CONCURRENCY))
-SESSION = None
+REMOVER = None
 
 
 # ── Middleware ────────────────────────────────────────────────────────────────
@@ -47,24 +41,18 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "port": os.getenv("PORT"), "model": RMBG_MODEL}
+    return {"ok": True, "port": os.getenv("PORT"), "mode": MODE}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def get_session():
-    global SESSION
-    if SESSION is None:
-        print(f"loading rembg model: {RMBG_MODEL}", flush=True)
-        SESSION = new_session(RMBG_MODEL)
-        print("rembg model loaded", flush=True)
-    return SESSION
-
-def pil_open_rgb(data: bytes) -> Image.Image:
-    img = Image.open(io.BytesIO(data))
-    if img.mode != "RGB":
-        img = img.convert("RGB")
-    return img
+def get_remover():
+    global REMOVER
+    if REMOVER is None:
+        print(f"loading InSPyReNet model: mode={MODE}", flush=True)
+        REMOVER = Remover(mode=MODE)
+        print("InSPyReNet model loaded", flush=True)
+    return REMOVER
 
 def resize_if_huge(img: Image.Image) -> Image.Image:
     w, h = img.size
@@ -94,18 +82,20 @@ async def process_image(file: UploadFile = File(...)):
         if len(raw) > MAX_UPLOAD_BYTES:
             return JSONResponse({"error": f"File too large. Max {MAX_UPLOAD_MB}MB"}, status_code=413)
 
-        # Open, normalise to RGB, cap dimensions
-        pil_img = pil_open_rgb(raw)
-        pil_img = resize_if_huge(pil_img)
+        # Open and normalise
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        img = resize_if_huge(img)
 
-        # Convert to PNG bytes for rembg
+        # Run InSPyReNet — returns RGBA PIL image
+        print("running InSPyReNet", flush=True)
+        result = get_remover().process(img, type="rgba")
+        print("InSPyReNet complete", flush=True)
+
+        # Encode to PNG bytes
         buf = io.BytesIO()
-        pil_img.save(buf, format="PNG")
-        png_in = buf.getvalue()
-
-        print("running rembg", flush=True)
-        out = remove(png_in, session=get_session())
-        print(f"rembg output bytes: {len(out)}", flush=True)
+        result.save(buf, format="PNG")
+        out = buf.getvalue()
+        print(f"output bytes: {len(out)}", flush=True)
 
         return Response(content=out, media_type="image/png")
 
