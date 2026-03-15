@@ -16,9 +16,9 @@ QUEUE_TIMEOUT_S  = float(os.getenv("QUEUE_TIMEOUT_S", "60"))
 MAX_UPLOAD_MB    = int(os.getenv("MAX_UPLOAD_MB", "10"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 MAX_IMAGE_DIM    = int(os.getenv("MAX_IMAGE_DIM", "3000"))
-RMBG_MODEL       = os.getenv("RMBG_MODEL", "bria-rmbg")
+RMBG_MODEL       = os.getenv("RMBG_MODEL", "rmbg")
 
-app = FastAPI(title="image-processor", version="10.0.0")
+app = FastAPI(title="image-processor", version="11.0.0")
 SEM = asyncio.Semaphore(max(1, MAX_CONCURRENCY))
 SESSION = None
 
