@@ -1,6 +1,5 @@
 [build]
 builder = "dockerfile"
-buildArgs = { HF_TOKEN = "${{HF_TOKEN}}" }
 
 [deploy]
 healthcheckPath = "/health"
