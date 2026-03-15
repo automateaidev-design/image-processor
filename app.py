@@ -1,17 +1,32 @@
 import io
-
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from PIL import Image
+from PIL import Image, ImageFile
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 app = FastAPI(title="Image Processor")
+
+CANVAS_WIDTH = 1400
+CANVAS_HEIGHT = 1700
+
+# High quality WebP settings
+WEBP_QUALITY = 95
+WEBP_METHOD = 6
 
 
 class ProcessRequest(BaseModel):
     image_url: str
-    filename: str | None = "processed.png"
+    filename: str = "processed.webp"
+
+
+def sanitize_filename(filename: str) -> str:
+    filename = filename.split("/")[-1]
+    if "." in filename:
+        filename = filename.rsplit(".", 1)[0]
+    return f"{filename}.webp"
 
 
 def trim_transparent_edges(img: Image.Image) -> Image.Image:
@@ -21,34 +36,28 @@ def trim_transparent_edges(img: Image.Image) -> Image.Image:
     alpha = img.getchannel("A")
     bbox = alpha.getbbox()
 
-    # If the image is fully transparent or bbox can't be found, return as-is
     if not bbox:
         return img
 
     return img.crop(bbox)
 
 
-def fit_to_canvas(img: Image.Image, canvas_w: int = 1400, canvas_h: int = 1700) -> Image.Image:
-    if img.mode != "RGBA":
-        img = img.convert("RGBA")
+def fit_to_canvas(img: Image.Image) -> Image.Image:
 
     src_w, src_h = img.size
-    if src_w <= 0 or src_h <= 0:
-        raise ValueError("Invalid source image dimensions")
 
-    # Scale proportionally until one edge touches the canvas
-    scale = min(canvas_w / src_w, canvas_h / src_h)
-    new_w = max(1, round(src_w * scale))
-    new_h = max(1, round(src_h * scale))
+    scale = min(CANVAS_WIDTH / src_w, CANVAS_HEIGHT / src_h)
+
+    new_w = round(src_w * scale)
+    new_h = round(src_h * scale)
 
     resized = img.resize((new_w, new_h), Image.LANCZOS)
 
-    # Transparent canvas
-    canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    canvas = Image.new("RGBA", (CANVAS_WIDTH, CANVAS_HEIGHT), (0, 0, 0, 0))
 
-    # Center the resized image
-    x = (canvas_w - new_w) // 2
-    y = (canvas_h - new_h) // 2
+    x = (CANVAS_WIDTH - new_w) // 2
+    y = (CANVAS_HEIGHT - new_h) // 2
+
     canvas.paste(resized, (x, y), resized)
 
     return canvas
@@ -61,25 +70,31 @@ def health():
 
 @app.post("/process-image")
 def process_image(payload: ProcessRequest):
+
     try:
         resp = requests.get(payload.image_url, timeout=60)
         resp.raise_for_status()
 
         img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
 
-        # Remove transparent outer padding first
+        # remove transparent borders
         img = trim_transparent_edges(img)
 
-        # Fit onto 1400 x 1700 transparent canvas
-        final_img = fit_to_canvas(img, 1400, 1700)
+        # scale + center
+        final_img = fit_to_canvas(img)
 
         output = io.BytesIO()
-        final_img.save(output, format="PNG")
+
+        final_img.save(
+            output,
+            format="WEBP",
+            quality=WEBP_QUALITY,
+            method=WEBP_METHOD
+        )
+
         output.seek(0)
 
-        filename = payload.filename or "processed.png"
-        if not filename.lower().endswith(".png"):
-            filename += ".png"
+        filename = sanitize_filename(payload.filename)
 
         headers = {
             "Content-Disposition": f'attachment; filename="{filename}"'
@@ -87,11 +102,9 @@ def process_image(payload: ProcessRequest):
 
         return StreamingResponse(
             output,
-            media_type="image/png",
-            headers=headers,
+            media_type="image/webp",
+            headers=headers
         )
 
-    except requests.RequestException as e:
-        raise HTTPException(status_code=400, detail=f"Failed to download image: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
