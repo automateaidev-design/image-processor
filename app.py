@@ -1,10 +1,10 @@
-print(f"Starting app with PORT={os.getenv('PORT')}", flush=True)
 import io
 import os
 import gc
 import asyncio
 from typing import Optional, Tuple
 
+print(f"Starting app with PORT={os.getenv('PORT')}", flush=True)
 import numpy as np
 import cv2
 from fastapi import FastAPI, UploadFile, File, Form
