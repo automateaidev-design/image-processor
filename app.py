@@ -14,7 +14,6 @@ import torch
 from PIL import Image
 from transformers import AutoModelForImageSegmentation
 from torchvision.transforms.functional import normalize
-import huggingface_hub
 
 # -------------------------------------------------
 # Stability / performance
@@ -38,12 +37,12 @@ SELF_RESTART_SECONDS = int(os.getenv("SELF_RESTART_SECONDS", "600"))
 # App + model
 # -------------------------------------------------
 
-app = FastAPI(title="image-processor", version="6.0.0")
+app = FastAPI(title="image-processor", version="6.1.0")
 
 # RMBG-2.0 config
 # Model is downloaded from HuggingFace on first startup (~200MB).
 # Mount a Railway volume at /model-cache to persist across deploys.
-RMBG_MODEL_ID = os.getenv("RMBG_MODEL_ID", "briaai/RMBG-2.0")
+RMBG_MODEL_ID = os.getenv("RMBG_MODEL_ID", "briaai/RMBG-1.4")
 RMBG_CACHE_DIR = os.getenv("RMBG_CACHE_DIR", "/model-cache")
 
 TARGET_W = int(os.getenv("TARGET_W", "1400"))
@@ -62,11 +61,6 @@ SEM = asyncio.Semaphore(max(1, MAX_CONCURRENCY))
 @app.on_event("startup")
 async def _startup():
     global _model
-
-    hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN") or None
-    if hf_token:
-        huggingface_hub.login(token=hf_token, add_to_git_credential=False)
-
     _model = AutoModelForImageSegmentation.from_pretrained(
         RMBG_MODEL_ID,
         trust_remote_code=True,
@@ -572,7 +566,7 @@ def health():
         "model": RMBG_MODEL_ID,
         "device": str(_device),
         "max_concurrency": MAX_CONCURRENCY,
-        "version": "6.0.0",
+        "version": "6.1.0",
     }
 
 
