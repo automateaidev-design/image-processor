@@ -18,8 +18,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Pre-download InSPyReNet base model during build
-RUN python -c "from transparent_background import Remover; Remover(mode='base')"
+# Pre-download BRIA RMBG-2.0 model at build time
+# HF_TOKEN must be set as a build arg
+ARG HF_TOKEN
+ENV HF_TOKEN=${HF_TOKEN}
+RUN python -c "from rembg import new_session; new_session('bria-rmbg')"
 
 COPY app.py .
 
