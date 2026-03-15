@@ -14,6 +14,7 @@ import torch
 from PIL import Image
 from transformers import AutoModelForImageSegmentation
 from torchvision.transforms.functional import normalize
+import huggingface_hub
 
 # -------------------------------------------------
 # Stability / performance
@@ -61,12 +62,15 @@ SEM = asyncio.Semaphore(max(1, MAX_CONCURRENCY))
 @app.on_event("startup")
 async def _startup():
     global _model
+
     hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN") or None
+    if hf_token:
+        huggingface_hub.login(token=hf_token, add_to_git_credential=False)
+
     _model = AutoModelForImageSegmentation.from_pretrained(
         RMBG_MODEL_ID,
         trust_remote_code=True,
         cache_dir=RMBG_CACHE_DIR,
-        token=hf_token,
     )
     _model.to(_device)
     _model.eval()
