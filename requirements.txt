@@ -2,5 +2,3 @@ fastapi
 uvicorn[standard]
 requests
 pillow
-boto3
-python-multipart
