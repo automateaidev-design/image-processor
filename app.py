@@ -34,7 +34,7 @@ SELF_RESTART_SECONDS = int(os.getenv("SELF_RESTART_SECONDS", "600"))
 # App + model
 # -------------------------------------------------
 
-app = FastAPI(title="image-processor", version="5.0.0")
+app = FastAPI(title="image-processor", version="5.1.0")
 
 # InSPyReNet options
 # INSPYRE_JIT=on  → TorchScript JIT (faster after warmup, larger startup cost)
@@ -334,6 +334,44 @@ def self_clip_alpha(alpha: np.ndarray, fg_thresh: int = 40, dilation_px: int = 8
     return (alpha.astype(np.float32) * allowed_soft).clip(0, 255).astype(np.uint8)
 
 
+def smooth_alpha_edges(alpha: np.ndarray, max_dim: int) -> np.ndarray:
+    """
+    Apply a gentle Gaussian blur to the alpha channel, confined to the
+    narrow transition band at the object edge.
+
+    Purpose: smooth staircase/pixelation artifacts on low-resolution source
+    images where the model's alpha boundary inherits the pixel grid of the
+    input. Has no visible effect on large clean images because:
+      - sigma scales with image size (tiny on large images)
+      - effect is masked to the edge band only (interior never touched)
+      - the blur is soft — it rounds jagged steps, not reshape edges
+
+    Sigma scaling:
+      small image  (<700px)  → sigma 0.8  (barely any smoothing)
+      medium image (<1600px) → sigma 1.2
+      large image  (>=1600px)→ sigma 0.6  (large images rarely need it)
+    """
+    if max_dim < 700:
+        sigma = 0.8
+    elif max_dim < 1600:
+        sigma = 1.2
+    else:
+        sigma = 0.6
+
+    # Build edge band: dilate/erode the solid-fg region
+    solid = (alpha > 200).astype(np.uint8)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
+    edge_band = (cv2.dilate(solid, k) - cv2.erode(solid, k)).astype(bool)
+
+    # Blur the full alpha, then blend only within the edge band
+    alpha_f = alpha.astype(np.float32)
+    blurred = cv2.GaussianBlur(alpha_f, (0, 0), sigmaX=sigma)
+
+    result = alpha_f.copy()
+    result[edge_band] = blurred[edge_band]
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
 def colour_unmix(rgb: np.ndarray, alpha: np.ndarray, bg_color: np.ndarray) -> np.ndarray:
     """
     Reverse background colour contamination on semi-transparent edge pixels.
@@ -453,10 +491,11 @@ def choose_best_rgba(rgb: np.ndarray) -> np.ndarray:
     if ff_mask is not None and ff_score >= rb_score + 2.0:
         return build_rgba_from_floodfill(rgb, ff_mask)
 
-    # Main path: self-clip + colour unmix
+    # Main path: self-clip → edge smoothing → colour unmix
     clipped_alpha = self_clip_alpha(rb_alpha, fg_thresh=40, dilation_px=8)
-    rgb_clean = colour_unmix(rb_rgb, clipped_alpha, bg_color)
-    return np.dstack([rgb_clean, clipped_alpha])
+    smooth_alpha = smooth_alpha_edges(clipped_alpha, max_dim)
+    rgb_clean = colour_unmix(rb_rgb, smooth_alpha, bg_color)
+    return np.dstack([rgb_clean, smooth_alpha])
 
 
 def resize_if_huge(img: Image.Image) -> Image.Image:
@@ -479,7 +518,7 @@ def health():
         "jit": INSPYRE_JIT,
         "threshold": INSPYRE_THRESHOLD,
         "max_concurrency": MAX_CONCURRENCY,
-        "version": "5.0.0",
+        "version": "5.1.0",
     }
 
 
