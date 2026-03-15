@@ -1,7 +1,8 @@
 fastapi
 uvicorn[standard]
 python-multipart
-transparent-background
+transformers
+huggingface_hub
 pillow
 opencv-python-headless
 numpy<2
