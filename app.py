@@ -34,7 +34,7 @@ SELF_RESTART_SECONDS = int(os.getenv("SELF_RESTART_SECONDS", "600"))
 # App + model
 # -------------------------------------------------
 
-app = FastAPI(title="image-processor", version="5.2.0")
+app = FastAPI(title="image-processor", version="5.3.0")
 
 # InSPyReNet options
 # INSPYRE_JIT=on  → TorchScript JIT (faster after warmup, larger startup cost)
@@ -498,14 +498,20 @@ def choose_best_rgba(rgb: np.ndarray) -> np.ndarray:
 
     # Power curve: suppresses low-alpha fringe pixels toward 0 while
     # leaving solid pixels (alpha ~255) virtually unchanged.
-    # a_out = (a/255)^1.6 * 255
-    # At alpha=30  → output ~7   (fringe becomes invisible)
-    # At alpha=128 → output ~86  (soft edge slightly tightened)
-    # At alpha=230 → output ~210 (solid pixels barely affected)
-    # Increase exponent (e.g. 1.8) to cut fringe harder;
-    # decrease (e.g. 1.3) if fine detail like thin wires starts clipping.
+    # a_out = (a/255)^2.2 * 255
+    # At alpha=20  → output ~1   (fringe invisible)
+    # At alpha=40  → output ~4   (halo effectively gone)
+    # At alpha=128 → output ~60  (soft edge tightened)
+    # At alpha=220 → output ~170 (solid pixels barely affected)
+    # At alpha=255 → output 255  (unchanged)
+    # Increase exponent to cut harder; decrease if thin detail clips.
     a_f = smooth_alpha.astype(np.float32) / 255.0
-    a_curved = np.power(np.clip(a_f, 0.0, 1.0), 1.6) * 255.0
+    a_curved = np.power(np.clip(a_f, 0.0, 1.0), 2.2) * 255.0
+
+    # Hard zero floor: any pixel below alpha 20 after the curve is
+    # invisible noise — zero it completely to eliminate grey fog.
+    a_curved[a_curved < 20] = 0.0
+
     final_alpha = np.clip(a_curved, 0, 255).astype(np.uint8)
 
     return np.dstack([rgb_clean, final_alpha])
@@ -531,7 +537,7 @@ def health():
         "jit": INSPYRE_JIT,
         "threshold": INSPYRE_THRESHOLD,
         "max_concurrency": MAX_CONCURRENCY,
-        "version": "5.2.0",
+        "version": "5.3.0",
     }
 
 
