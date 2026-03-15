@@ -1,3 +1,4 @@
+print(f"Starting app with PORT={os.getenv('PORT')}", flush=True)
 import io
 import os
 import gc
