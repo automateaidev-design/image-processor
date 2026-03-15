@@ -10,7 +10,10 @@ from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import Response, JSONResponse
 from PIL import Image
 
-from transparent_background import Remover
+import torch
+from PIL import Image
+from transformers import AutoModelForImageSegmentation
+from torchvision.transforms.functional import normalize
 
 # -------------------------------------------------
 # Stability / performance
@@ -34,17 +37,13 @@ SELF_RESTART_SECONDS = int(os.getenv("SELF_RESTART_SECONDS", "600"))
 # App + model
 # -------------------------------------------------
 
-app = FastAPI(title="image-processor", version="5.4.0")
+app = FastAPI(title="image-processor", version="6.0.0")
 
-# InSPyReNet options
-# INSPYRE_JIT=on  → TorchScript JIT (faster after warmup, larger startup cost)
-# INSPYRE_JIT=off → default (safer on CPU-only / limited RAM environments)
-INSPYRE_JIT = os.getenv("INSPYRE_JIT", "off").strip().lower() == "on"
-
-# Alpha threshold for InSPyReNet's hard-threshold mode.
-# 0.0 = use the model's native soft alpha (recommended — keeps smooth edges).
-# 0.1–0.9 = binarise at that level (useful if you want hard masks).
-INSPYRE_THRESHOLD = float(os.getenv("INSPYRE_THRESHOLD", "0.0"))
+# RMBG-2.0 config
+# Model is downloaded from HuggingFace on first startup (~200MB).
+# Mount a Railway volume at /model-cache to persist across deploys.
+RMBG_MODEL_ID = os.getenv("RMBG_MODEL_ID", "briaai/RMBG-2.0")
+RMBG_CACHE_DIR = os.getenv("RMBG_CACHE_DIR", "/model-cache")
 
 TARGET_W = int(os.getenv("TARGET_W", "1400"))
 TARGET_H = int(os.getenv("TARGET_H", "1700"))
@@ -54,14 +53,21 @@ MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
 MAX_IMAGE_DIM = int(os.getenv("MAX_IMAGE_DIM", "8000"))
 
-_remover: Optional[Remover] = None
+_model = None
+_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEM = asyncio.Semaphore(max(1, MAX_CONCURRENCY))
 
 
 @app.on_event("startup")
 async def _startup():
-    global _remover
-    _remover = Remover(jit=INSPYRE_JIT)
+    global _model
+    _model = AutoModelForImageSegmentation.from_pretrained(
+        RMBG_MODEL_ID,
+        trust_remote_code=True,
+        cache_dir=RMBG_CACHE_DIR,
+    )
+    _model.to(_device)
+    _model.eval()
 
     if ENABLE_SELF_RESTART:
         async def _restarter():
@@ -395,27 +401,54 @@ def colour_unmix(rgb: np.ndarray, alpha: np.ndarray, bg_color: np.ndarray) -> np
 
 
 # -------------------------------------------------
-# InSPyReNet model inference
+# RMBG-2.0 model inference
 # -------------------------------------------------
 
-def inspyrenet_rgba(rgb: np.ndarray) -> np.ndarray:
-    """
-    Run InSPyReNet (transparent_background) and return H×W×4 uint8 RGBA.
+# RMBG-2.0 expects 1024×1024 input normalised to these values
+_RMBG_SIZE = (1024, 1024)
+_RMBG_MEAN = [0.5, 0.5, 0.5]
+_RMBG_STD  = [1.0, 1.0, 1.0]
 
-    Uses INSPYRE_THRESHOLD env var:
-      0.0  → native soft alpha from the model (default, best for smooth edges)
-      >0.0 → threshold the alpha at that level (harder mask, e.g. 0.5)
+
+def rmbg2_rgba(rgb: np.ndarray) -> np.ndarray:
     """
+    Run RMBG-2.0 and return H×W×4 uint8 RGBA at the original image size.
+
+    RMBG-2.0 is purpose-built for product/commercial photography and
+    produces significantly cleaner alpha boundaries than InSPyReNet,
+    especially for light-coloured objects on similar backgrounds.
+    """
+    orig_h, orig_w = rgb.shape[:2]
     pil_img = Image.fromarray(rgb, mode="RGB")
 
-    if INSPYRE_THRESHOLD > 0.0:
-        result = _remover.process(pil_img, type="rgba", threshold=INSPYRE_THRESHOLD)
-    else:
-        result = _remover.process(pil_img, type="rgba")
+    # Resize to model input size
+    input_img = pil_img.resize(_RMBG_SIZE, Image.BILINEAR)
 
-    if result.mode != "RGBA":
-        result = result.convert("RGBA")
-    return np.array(result)   # H × W × 4, uint8
+    # To tensor, normalise
+    img_t = torch.from_numpy(np.array(input_img)).float() / 255.0
+    img_t = img_t.permute(2, 0, 1).unsqueeze(0)          # 1×3×H×W
+    img_t = normalize(img_t, _RMBG_MEAN, _RMBG_STD)
+    img_t = img_t.to(_device)
+
+    with torch.no_grad():
+        result = _model(img_t)
+
+    # result is a list of tensors; take the last sigmoid output
+    mask_t = torch.sigmoid(result[-1])[0, 0]              # H×W, float 0–1
+    mask_np = mask_t.cpu().numpy()
+
+    # Resize mask back to original image size
+    mask_resized = cv2.resize(
+        mask_np, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR
+    )
+    alpha = np.clip(mask_resized * 255, 0, 255).astype(np.uint8)
+
+    return np.dstack([rgb, alpha])   # H×W×4
+
+
+def inspyrenet_rgba(rgb: np.ndarray) -> np.ndarray:
+    """Alias so choose_best_rgba doesn't need renaming."""
+    return rmbg2_rgba(rgb)
 
 
 def floodfill_mask(rgb: np.ndarray) -> Tuple[np.ndarray, dict]:
@@ -530,11 +563,10 @@ def resize_if_huge(img: Image.Image) -> Image.Image:
 def health():
     return {
         "ok": True,
-        "model": "inspyrenet",
-        "jit": INSPYRE_JIT,
-        "threshold": INSPYRE_THRESHOLD,
+        "model": RMBG_MODEL_ID,
+        "device": str(_device),
         "max_concurrency": MAX_CONCURRENCY,
-        "version": "5.4.0",
+        "version": "6.0.0",
     }
 
 
@@ -564,7 +596,7 @@ async def process_image(
     pil_img = rgb = rgba = fitted = None
 
     try:
-        if _remover is None:
+        if _model is None:
             return JSONResponse({"error": "Model not ready"}, status_code=503)
 
         raw = await file.read()
