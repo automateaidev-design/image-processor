@@ -18,11 +18,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Pre-download BRIA RMBG-2.0 model at build time
-# HF_TOKEN must be set as a build arg
-ARG HF_TOKEN
-ENV HF_TOKEN=${HF_TOKEN}
-RUN python -c "from rembg import new_session; new_session('bria-rmbg')"
+RUN mkdir -p /app/models
+
+# Pre-download RMBG-1.4 — same model as rembg.com
+RUN python -c "from rembg import new_session; new_session('rmbg')"
 
 COPY app.py .
 
