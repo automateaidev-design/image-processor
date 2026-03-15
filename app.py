@@ -2,11 +2,7 @@ import io
 import os
 import gc
 import asyncio
-from typing import Optional, Tuple
-
-import numpy as np
-import cv2
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import Response, JSONResponse
 from PIL import Image
 from rembg import remove, new_session
@@ -14,32 +10,36 @@ from rembg import remove, new_session
 print(f"Starting app with PORT={os.getenv('PORT')}", flush=True)
 
 try:
+    import cv2
     cv2.setNumThreads(1)
 except Exception:
     pass
 
-PIL_MAX_IMAGE_PIXELS = int(os.getenv("PIL_MAX_IMAGE_PIXELS", "60000000"))
-Image.MAX_IMAGE_PIXELS = PIL_MAX_IMAGE_PIXELS
+Image.MAX_IMAGE_PIXELS = int(os.getenv("PIL_MAX_IMAGE_PIXELS", "60000000"))
 
-MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "1"))
-QUEUE_TIMEOUT_S = float(os.getenv("QUEUE_TIMEOUT_S", "30"))
-TARGET_W = int(os.getenv("TARGET_W", "1400"))
-TARGET_H = int(os.getenv("TARGET_H", "1700"))
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "10"))
-MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
-MAX_IMAGE_DIM = int(os.getenv("MAX_IMAGE_DIM", "3000"))
-RMBG_MODEL = os.getenv("RMBG_MODEL", "isnet-general-use")
+MAX_CONCURRENCY    = int(os.getenv("MAX_CONCURRENCY", "1"))
+QUEUE_TIMEOUT_S    = float(os.getenv("QUEUE_TIMEOUT_S", "30"))
+MAX_UPLOAD_MB      = int(os.getenv("MAX_UPLOAD_MB", "10"))
+MAX_UPLOAD_BYTES   = MAX_UPLOAD_MB * 1024 * 1024
+MAX_IMAGE_DIM      = int(os.getenv("MAX_IMAGE_DIM", "3000"))
+RMBG_MODEL         = os.getenv("RMBG_MODEL", "birefnet-general")
 
-app = FastAPI(title="image-processor", version="7.0.0")
+app = FastAPI(title="image-processor", version="8.0.0")
 SEM = asyncio.Semaphore(max(1, MAX_CONCURRENCY))
 SESSION = None
 
+
+# ── Middleware ────────────────────────────────────────────────────────────────
+
 @app.middleware("http")
 async def log_requests(request, call_next):
-    print(f"incoming request: {request.method} {request.url.path}", flush=True)
+    print(f"incoming: {request.method} {request.url.path}", flush=True)
     response = await call_next(request)
-    print(f"completed request: {request.method} {request.url.path} -> {response.status_code}", flush=True)
+    print(f"completed: {request.method} {request.url.path} → {response.status_code}", flush=True)
     return response
+
+
+# ── Health ────────────────────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
@@ -48,6 +48,9 @@ def root():
 @app.get("/health")
 def health():
     return {"ok": True, "port": os.getenv("PORT"), "model": RMBG_MODEL}
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def get_session():
     global SESSION
@@ -68,22 +71,21 @@ def resize_if_huge(img: Image.Image) -> Image.Image:
     if max(w, h) <= MAX_IMAGE_DIM:
         return img
     scale = MAX_IMAGE_DIM / float(max(w, h))
-    nw = int(round(w * scale))
-    nh = int(round(h * scale))
-    return img.resize((nw, nh), Image.LANCZOS)
+    return img.resize((int(round(w * scale)), int(round(h * scale))), Image.LANCZOS)
+
+
+# ── Main endpoint ─────────────────────────────────────────────────────────────
 
 @app.post("/process")
-async def process_image(
-    file: UploadFile = File(...),
-    output: str = Form("png"),
-):
+async def process_image(file: UploadFile = File(...)):
     try:
         await asyncio.wait_for(SEM.acquire(), timeout=QUEUE_TIMEOUT_S)
     except asyncio.TimeoutError:
-        return JSONResponse({"error": "Service busy"}, status_code=503)
+        return JSONResponse({"error": "Service busy — try again shortly"}, status_code=503)
 
     try:
         print("process start", flush=True)
+
         raw = await file.read()
         print(f"upload bytes: {len(raw) if raw else 0}", flush=True)
 
@@ -92,9 +94,11 @@ async def process_image(
         if len(raw) > MAX_UPLOAD_BYTES:
             return JSONResponse({"error": f"File too large. Max {MAX_UPLOAD_MB}MB"}, status_code=413)
 
+        # Open, normalise to RGB, cap dimensions
         pil_img = pil_open_rgb(raw)
         pil_img = resize_if_huge(pil_img)
 
+        # Convert to PNG bytes for rembg
         buf = io.BytesIO()
         pil_img.save(buf, format="PNG")
         png_in = buf.getvalue()
@@ -108,6 +112,7 @@ async def process_image(
     except Exception as e:
         print(f"process error: {repr(e)}", flush=True)
         return JSONResponse({"error": str(e)}, status_code=500)
+
     finally:
         try:
             SEM.release()
