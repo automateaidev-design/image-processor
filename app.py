@@ -1,11 +1,7 @@
 import io
 import os
 import gc
-import json
-import shutil
 import asyncio
-import subprocess
-import tempfile
 from typing import Optional, Tuple
 
 import numpy as np
@@ -13,6 +9,7 @@ import cv2
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import Response, JSONResponse
 from PIL import Image
+from rembg import remove, new_session
 
 try:
     cv2.setNumThreads(1)
@@ -32,16 +29,13 @@ MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 MAX_IMAGE_DIM = int(os.getenv("MAX_IMAGE_DIM", "8000"))
 
-RMBG_CLI_DIR = os.getenv("RMBG_CLI_DIR", "/opt/rembg-cli")
-NODE_BIN = os.getenv("NODE_BIN", "node")
-X_API_KEY = os.getenv("X_API_KEY", "")
+RMBG_MODEL = os.getenv("RMBG_MODEL", "isnet-general-use")
 
-app = FastAPI(title="image-processor", version="5.0.0")
+app = FastAPI(title="image-processor", version="6.0.0")
 SEM = asyncio.Semaphore(max(1, MAX_CONCURRENCY))
 
-
-def clamp_int(v: int, lo: int, hi: int) -> int:
-    return max(lo, min(hi, int(v)))
+# Create one persistent rembg session so the model is loaded once
+SESSION = new_session(RMBG_MODEL)
 
 
 def clamp_float(v: float, lo: float, hi: float) -> float:
@@ -153,58 +147,16 @@ def build_filename(prefix: str, mpn: str, sku: str, ext: str) -> str:
     return f"{clean(prefix)}_{clean(mpn)}_{clean(sku)}.{ext}"
 
 
-def run_rembg_cli(input_bytes: bytes) -> bytes:
-    if not X_API_KEY:
-        raise RuntimeError("Missing X_API_KEY environment variable")
-
-    cli_entry = os.path.join(RMBG_CLI_DIR, "index.js")
-    if not os.path.exists(cli_entry):
-        raise RuntimeError(f"rembg-cli not found at {cli_entry}")
-
-    with tempfile.TemporaryDirectory() as td:
-        in_path = os.path.join(td, "input.png")
-        out_path = os.path.join(td, "output.png")
-
-        with open(in_path, "wb") as f:
-            f.write(input_bytes)
-
-        env = os.environ.copy()
-        env["X_API_KEY"] = X_API_KEY
-
-        # This assumes the cloned repo exposes a CLI that accepts:
-        # node index.js <input> <output>
-        # If your specific fork differs, only this command line needs adjusting.
-        cmd = [NODE_BIN, cli_entry, in_path, out_path]
-
-        proc = subprocess.run(
-            cmd,
-            cwd=RMBG_CLI_DIR,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"rembg-cli failed: {proc.stderr.strip() or proc.stdout.strip() or 'unknown error'}"
-            )
-
-        if not os.path.exists(out_path):
-            raise RuntimeError("rembg-cli did not produce an output file")
-
-        with open(out_path, "rb") as f:
-            return f.read()
+def run_rembg_local(input_bytes: bytes) -> bytes:
+    return remove(input_bytes, session=SESSION)
 
 
 @app.get("/health")
 def health():
-    cli_entry = os.path.join(RMBG_CLI_DIR, "index.js")
     return {
         "ok": True,
-        "version": "5.0.0",
-        "rembg_cli_present": os.path.exists(cli_entry),
-        "x_api_key_present": bool(X_API_KEY),
+        "version": "6.0.0",
+        "model": RMBG_MODEL,
     }
 
 
@@ -250,7 +202,7 @@ async def process_image(
         pil_img.save(tmp, format="PNG")
         png_in = tmp.getvalue()
 
-        cutout_bytes = run_rembg_cli(png_in)
+        cutout_bytes = run_rembg_local(png_in)
         cutout_img = ensure_rgba_from_bytes(cutout_bytes)
         rgba = np.array(cutout_img)
 
@@ -283,8 +235,6 @@ async def process_image(
             },
         )
 
-    except subprocess.TimeoutExpired:
-        return JSONResponse({"error": "rembg-cli timed out"}, status_code=504)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
     finally:
