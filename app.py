@@ -61,10 +61,12 @@ SEM = asyncio.Semaphore(max(1, MAX_CONCURRENCY))
 @app.on_event("startup")
 async def _startup():
     global _model
+    hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN") or None
     _model = AutoModelForImageSegmentation.from_pretrained(
         RMBG_MODEL_ID,
         trust_remote_code=True,
         cache_dir=RMBG_CACHE_DIR,
+        token=hf_token,
     )
     _model.to(_device)
     _model.eval()
