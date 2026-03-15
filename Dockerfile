@@ -17,6 +17,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
+# Pre-download rembg model during build
+RUN python -c "from rembg import new_session; new_session('isnet-general-use')"
+
 COPY app.py .
 
 EXPOSE 8000
