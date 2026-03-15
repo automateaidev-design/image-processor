@@ -1,113 +1,97 @@
 import io
-import os
-import gc
-import asyncio
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import Response, JSONResponse
+
+import requests
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from PIL import Image
-from rembg import remove, new_session
 
-print(f"Starting app with PORT={os.getenv('PORT')}", flush=True)
-
-Image.MAX_IMAGE_PIXELS = int(os.getenv("PIL_MAX_IMAGE_PIXELS", "60000000"))
-
-MAX_CONCURRENCY  = int(os.getenv("MAX_CONCURRENCY", "1"))
-QUEUE_TIMEOUT_S  = float(os.getenv("QUEUE_TIMEOUT_S", "60"))
-MAX_UPLOAD_MB    = int(os.getenv("MAX_UPLOAD_MB", "10"))
-MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
-MAX_IMAGE_DIM    = int(os.getenv("MAX_IMAGE_DIM", "3000"))
-RMBG_MODEL       = os.getenv("RMBG_MODEL", "bria-rmbg")
-
-app = FastAPI(title="image-processor", version="12.0.0")
-SEM = asyncio.Semaphore(max(1, MAX_CONCURRENCY))
-SESSION = None
+app = FastAPI(title="Image Processor")
 
 
-# ── Middleware ────────────────────────────────────────────────────────────────
-
-@app.middleware("http")
-async def log_requests(request, call_next):
-    print(f"incoming: {request.method} {request.url.path}", flush=True)
-    response = await call_next(request)
-    print(f"completed: {request.method} {request.url.path} → {response.status_code}", flush=True)
-    return response
+class ProcessRequest(BaseModel):
+    image_url: str
+    filename: str | None = "processed.png"
 
 
-# ── Health ────────────────────────────────────────────────────────────────────
+def trim_transparent_edges(img: Image.Image) -> Image.Image:
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
 
-@app.get("/")
-def root():
-    return {"ok": True, "message": "service alive"}
+    alpha = img.getchannel("A")
+    bbox = alpha.getbbox()
+
+    # If the image is fully transparent or bbox can't be found, return as-is
+    if not bbox:
+        return img
+
+    return img.crop(bbox)
+
+
+def fit_to_canvas(img: Image.Image, canvas_w: int = 1400, canvas_h: int = 1700) -> Image.Image:
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+
+    src_w, src_h = img.size
+    if src_w <= 0 or src_h <= 0:
+        raise ValueError("Invalid source image dimensions")
+
+    # Scale proportionally until one edge touches the canvas
+    scale = min(canvas_w / src_w, canvas_h / src_h)
+    new_w = max(1, round(src_w * scale))
+    new_h = max(1, round(src_h * scale))
+
+    resized = img.resize((new_w, new_h), Image.LANCZOS)
+
+    # Transparent canvas
+    canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+
+    # Center the resized image
+    x = (canvas_w - new_w) // 2
+    y = (canvas_h - new_h) // 2
+    canvas.paste(resized, (x, y), resized)
+
+    return canvas
+
 
 @app.get("/health")
 def health():
-    return {"ok": True, "port": os.getenv("PORT"), "model": RMBG_MODEL}
+    return {"ok": True}
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def get_session():
-    global SESSION
-    if SESSION is None:
-        print(f"loading model: {RMBG_MODEL}", flush=True)
-        SESSION = new_session(RMBG_MODEL)
-        print("model loaded", flush=True)
-    return SESSION
-
-def resize_if_huge(img: Image.Image) -> Image.Image:
-    w, h = img.size
-    if max(w, h) <= MAX_IMAGE_DIM:
-        return img
-    scale = MAX_IMAGE_DIM / float(max(w, h))
-    return img.resize((int(round(w * scale)), int(round(h * scale))), Image.LANCZOS)
-
-
-# ── Main endpoint ─────────────────────────────────────────────────────────────
-
-@app.post("/process")
-async def process_image(file: UploadFile = File(...)):
+@app.post("/process-image")
+def process_image(payload: ProcessRequest):
     try:
-        await asyncio.wait_for(SEM.acquire(), timeout=QUEUE_TIMEOUT_S)
-    except asyncio.TimeoutError:
-        return JSONResponse({"error": "Service busy — try again shortly"}, status_code=503)
+        resp = requests.get(payload.image_url, timeout=60)
+        resp.raise_for_status()
 
-    try:
-        print("process start", flush=True)
+        img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
 
-        raw = await file.read()
-        print(f"upload bytes: {len(raw) if raw else 0}", flush=True)
+        # Remove transparent outer padding first
+        img = trim_transparent_edges(img)
 
-        if not raw:
-            return JSONResponse({"error": "Empty upload"}, status_code=400)
-        if len(raw) > MAX_UPLOAD_BYTES:
-            return JSONResponse({"error": f"File too large. Max {MAX_UPLOAD_MB}MB"}, status_code=413)
+        # Fit onto 1400 x 1700 transparent canvas
+        final_img = fit_to_canvas(img, 1400, 1700)
 
-        # Open, normalise to RGB, cap dimensions
-        img = Image.open(io.BytesIO(raw)).convert("RGB")
-        img = resize_if_huge(img)
+        output = io.BytesIO()
+        final_img.save(output, format="PNG")
+        output.seek(0)
 
-        # Convert to PNG bytes for rembg
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        png_in = buf.getvalue()
+        filename = payload.filename or "processed.png"
+        if not filename.lower().endswith(".png"):
+            filename += ".png"
 
-        print("running rembg", flush=True)
-        out = remove(
-            png_in,
-            session=get_session(),
-            post_process_mask=True,
+        headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        }
+
+        return StreamingResponse(
+            output,
+            media_type="image/png",
+            headers=headers,
         )
-        print(f"output bytes: {len(out)}", flush=True)
 
-        return Response(content=out, media_type="image/png")
-
+    except requests.RequestException as e:
+        raise HTTPException(status_code=400, detail=f"Failed to download image: {str(e)}")
     except Exception as e:
-        print(f"process error: {repr(e)}", flush=True)
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-    finally:
-        try:
-            SEM.release()
-        except Exception:
-            pass
-        gc.collect()
+        raise HTTPException(status_code=500, detail=str(e))
