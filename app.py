@@ -92,7 +92,11 @@ async def process_image(file: UploadFile = File(...)):
         png_in = buf.getvalue()
 
         print("running rembg", flush=True)
-        out = remove(png_in, session=get_session())
+        out = remove(
+    png_in,
+    session=get_session(),
+    post_process_mask=True,
+)
         print(f"output bytes: {len(out)}", flush=True)
 
         return Response(content=out, media_type="image/png")
