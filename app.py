@@ -1,9 +1,12 @@
 import io
+import os
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from PIL import Image, ImageFile
+
+os.environ["OMP_NUM_THREADS"] = "1"
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
