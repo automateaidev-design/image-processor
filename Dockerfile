@@ -9,4 +9,4 @@ COPY app.py .
 
 ENV PORT=8000
 
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT}"]
+CMD ["sh", "-c", "gunicorn app:app -k uvicorn.workers.UvicornWorker -w 4 -t 120 -b 0.0.0.0:${PORT}"]
